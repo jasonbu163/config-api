@@ -1,0 +1,92 @@
+name: build-release
+
+# 触发条件：推送 v 开头的 tag（如 v1.0.0），或在 Actions 页面手动触发
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# 上传 Release 需要写权限
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: config-api-windows-x64
+            bin: config-api.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: config-api-linux-x64
+            bin: config-api
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: config-api-macos-arm64
+            bin: config-api
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" dist/
+          # config.toml 与 README 是分发必需品，缺失时不要中断构建
+          if [ -f config.toml ]; then cp config.toml dist/; fi
+          if [ -f README.md ]; then cp README.md dist/; fi
+          ls -l dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Zip each platform
+        run: |
+          set -euo pipefail
+          cd artifacts
+          for d in */; do
+            name="${d%/}"
+            (cd "$name" && zip -r "../${name}.zip" .)
+          done
+          ls -l *.zip
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip
+          generate_release_notes: true
