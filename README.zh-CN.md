@@ -8,6 +8,7 @@
 
 ![rust](https://img.shields.io/badge/rust-1.85%2B-orange)
 ![axum](https://img.shields.io/badge/axum-0.8-blue)
+![license](https://img.shields.io/badge/license-MIT-green)
 
 > **当前状态**：仅为初始骨架。`src/main.rs` 还是 `cargo new` 生成的占位内容，下面的接口描述的是目标行为。
 
@@ -225,3 +226,9 @@ config-api/
 完整的设计说明、打包矩阵与 CI 原理见 [`docs/Axum配置接口_完整实现与打包指南.md`](docs/Axum配置接口_完整实现与打包指南.md)。
 
 后续可扩展：Bearer token 鉴权、审计日志（`时间<TAB>字段<TAB>旧值<TAB>新值`）、批量接口的 `dry_run` 预检。
+
+## 许可证
+
+本项目基于 [MIT 协议](LICENSE) 发布。
+
+Copyright (c) 2026 jasonbu163

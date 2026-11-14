@@ -8,6 +8,7 @@ Built with [axum](https://github.com/tokio-rs/axum) + [tokio](https://tokio.rs).
 
 ![rust](https://img.shields.io/badge/rust-1.85%2B-orange)
 ![axum](https://img.shields.io/badge/axum-0.8-blue)
+![license](https://img.shields.io/badge/license-MIT-green)
 
 > **Status**: early skeleton. `src/main.rs` is still the `cargo new` placeholder; the API documented below describes the intended behavior.
 
@@ -227,3 +228,9 @@ Planned module split:
 The full design notes, packaging matrix, and CI rationale live in [`docs/Axum配置接口_完整实现与打包指南.md`](docs/Axum配置接口_完整实现与打包指南.md) (Chinese).
 
 Planned extensions: bearer-token auth, audit log (`timestamp<TAB>field<TAB>old<TAB>new`), `dry_run` preflight for batch updates.
+
+## License
+
+Released under the [MIT License](LICENSE).
+
+Copyright (c) 2026 jasonbu163
