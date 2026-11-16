@@ -1,0 +1,15 @@
+# 服务与文件配置。开发期用仓库内的 ./data 目录，部署时改成真实目录即可。
+# 注意：TOML 字符串里 \ 是转义符，Windows 路径必须双写，例如
+# base_dir = "C:\\SmartView\\config"
+
+[server]
+host = "127.0.0.1"   # 局域网访问改成 "0.0.0.0"
+port = 18981
+
+[files]
+base_dir = "./data"
+file_name = "SmartViewConfig.txt"
+backup = true        # 修改前生成 .bak 备份
+
+[allowed_fields]
+fields = ["Thickness", "Temper", "Alloy", "Entry Width", "Exit Width", "DataName"]

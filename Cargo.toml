@@ -6,11 +6,18 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1.0.104"
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["multipart"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["full"] }
 toml = "1.2.1"
 tower-http = { version = "0.7.1", features = ["cors", "trace"] }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+
+[profile.release]
+lto = true          # 链接期优化，减小体积、提升性能
+codegen-units = 1   # 单代码生成单元，优化更彻底（编译更慢）
+strip = true        # 去掉调试符号，产物更小
+panic = "abort"     # panic 直接终止，不做栈展开

@@ -1,0 +1,19 @@
+@DataName
+BATCH001
+
+@Thickness
+30
+
+@Temper
+T4
+
+@Alloy
+5052
+
+@Entry Width
+1200
+
+@Exit Width
+1180
+
+# End of File
