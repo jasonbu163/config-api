@@ -176,10 +176,11 @@ Cross-platform rules worth remembering:
 
 ## Continuous Integration
 
-`.github/workflows/build.yml` builds all three platforms in parallel.
+`.github/workflows/build.yml` builds all four targets in parallel.
 
 - Triggered by a tag push (`v*`) or manually via *Run workflow*; pushing to `main` does **not** trigger it.
-- Matrix: `windows-latest` (x86_64-pc-windows-msvc), `ubuntu-latest` (x86_64-unknown-linux-gnu), `macos-latest` (aarch64-apple-darwin).
+- Matrix: `windows-2022` (x86_64-pc-windows-msvc, static CRT), `ubuntu-24.04` (x86_64-unknown-linux-musl), `ubuntu-24.04-arm` (aarch64-unknown-linux-musl), `macos-15` (aarch64-apple-darwin).
+- The musl builds are fully static, so they run regardless of the target machine's glibc version.
 - On tags, the `release` job zips each platform bundle and attaches it to a GitHub Release.
 
 ```bash
@@ -191,7 +192,7 @@ git push origin v0.1.0
 
 ```
 config-api/
-├── .github/workflows/build.yml   # 3-platform release pipeline
+├── .github/workflows/build.yml   # 4-target release pipeline
 ├── docs/                         # full implementation & packaging guide (Chinese)
 ├── src/
 │   └── main.rs

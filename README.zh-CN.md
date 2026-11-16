@@ -174,11 +174,12 @@ cargo build --release
 
 ## 持续集成
 
-`.github/workflows/build.yml` 让三个平台并行构建。
+`.github/workflows/build.yml` 让四个目标并行构建。
 
 - 触发条件是推送 tag（`v*`）或手动点 *Run workflow*；**推 `main` 分支不会触发**
-- matrix：`windows-latest`（x86_64-pc-windows-msvc）、`ubuntu-latest`（x86_64-unknown-linux-gnu）、`macos-latest`（aarch64-apple-darwin）
-- 推送 tag 时，`release` job 会把三个平台的包打成 zip 并挂到 GitHub Release
+- matrix：`windows-2022`（x86_64-pc-windows-msvc，静态 CRT）、`ubuntu-24.04`（x86_64-unknown-linux-musl）、`ubuntu-24.04-arm`（aarch64-unknown-linux-musl）、`macos-15`（aarch64-apple-darwin）
+- musl 产物完全静态，不依赖目标机的 glibc 版本，可直接在麒麟、统信、openEuler 上运行
+- 推送 tag 时，`release` job 会把四个平台的包打成 zip 并挂到 GitHub Release
 
 ```bash
 git tag v0.1.0
@@ -189,7 +190,7 @@ git push origin v0.1.0
 
 ```
 config-api/
-├── .github/workflows/build.yml   # 三平台发布流水线
+├── .github/workflows/build.yml   # 四目标发布流水线
 ├── docs/                         # 完整实现与打包指南
 ├── src/
 │   └── main.rs
