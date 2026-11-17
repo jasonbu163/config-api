@@ -26,7 +26,9 @@
 | 10 | 备份 + 临时文件 + 原子替换 | 失败时原文档不变 | 日志还是普通文本 |
 | 11 | JSON 日志 + 请求日志 | 每次请求一行 JSON | 浏览器跨域会被拦 |
 | 12 | CORS | 前端页面可跨域调用 | CORS 不是鉴权 |
-| 13 | 收口到最终版本 | 对照完整指南 | 生产还要加访问控制 |
+| 12.5 | Swagger UI（可选） | 浏览器打开 `/swagger-ui` 看接口文档 | 文档需随代码维护 |
+| 12.8 | 文件下载 + 存在性查询 | 短名下载文件，POST 查询是否存在及数量 | 每次请求都扫目录，且没有 Range |
+| 13 | 收口到最终版本 | 对照完整指南 | 生产要确认网络边界 |
 
 ---
 
@@ -1226,7 +1228,575 @@ curl -i -X OPTIONS http://127.0.0.1:8080/api/config/update \
 
 ### 重要提醒
 
-CORS 只解决浏览器同源策略，**不是鉴权**。任何 curl / Postman 都可以无视 CORS 直接调接口。上线前仍需 Bearer token 或网络层访问控制。
+CORS 只解决浏览器同源策略，**不是鉴权**。任何 curl / Postman 都可以无视 CORS 直接调接口。本方案不在代码里做鉴权，靠网络层隔离：`host` 绑具体内网 IP，或用防火墙只放行内网网段，上线前从外网验证端口不可达。
+
+---
+
+## 阶段 12.5（可选）：补一个 Swagger UI 页面
+
+### 先回答一个常见疑问
+
+**axum 不天然支持 Swagger UI。**
+
+- FastAPI 自带 `/docs` 和 OpenAPI 生成。
+- axum 只负责路由、提取器、中间件，定位更底层。
+- 想要 Swagger UI，需要自己引入 OpenAPI 生成库和静态页面库。
+
+常用组合：
+
+- `utoipa`：用宏从 Rust 代码生成 OpenAPI JSON。
+- `utoipa-swagger-ui`：把 Swagger UI 页面挂到 axum 路由上。
+
+所以教程前面没写它不是漏了核心能力，而是它属于**可选增强**；但它很适合放进教材，因为它能让你直观看到每个阶段新增了哪些接口。
+
+### 加依赖
+
+```bash
+cargo add utoipa --features axum_extras
+cargo add utoipa-swagger-ui --features axum
+```
+
+如果构建机不能联网，注意 `utoipa-swagger-ui` 默认可能要下载 Swagger UI 静态资源；离线场景请查对应版本的 `vendored` / 离线 feature，或提前准备资源。
+
+### 给请求 / 响应结构体加 `ToSchema`
+
+在 `handler.rs`：
+
+```rust
+use utoipa::ToSchema;
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateRequest {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct BatchRequest {
+    pub items: Vec<UpdateRequest>,
+}
+```
+
+在 `parser.rs`：
+
+```rust
+use utoipa::ToSchema;
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct Entry {
+    pub key: String,
+    pub value: String,
+}
+```
+
+### 给 handler 加接口注解
+
+```rust
+#[utoipa::path(
+    get,
+    path = "/api/config",
+    tag = "config",
+    responses((status = 200, description = "读取成功"))
+)]
+pub async fn read_config(/* ... */) -> Response { /* ... */ }
+
+#[utoipa::path(
+    post,
+    path = "/api/config/update",
+    tag = "config",
+    request_body = UpdateRequest,
+    responses(
+        (status = 200, description = "修改成功"),
+        (status = 400, description = "参数或白名单校验失败")
+    )
+)]
+pub async fn update_one(/* ... */) -> Response { /* ... */ }
+
+#[utoipa::path(
+    post,
+    path = "/api/config/batch-update",
+    tag = "config",
+    request_body = BatchRequest,
+    responses(
+        (status = 200, description = "批量修改成功"),
+        (status = 400, description = "批量校验失败")
+    )
+)]
+pub async fn batch_update(/* ... */) -> Response { /* ... */ }
+```
+
+`axum_extras` feature 的作用就是让 `utoipa` 能忽略 `State`、`Path` 这类 axum 专有提取器，只分析真正的请求体。
+
+### 定义 OpenAPI 文档入口
+
+在 `main.rs`：
+
+```rust
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        handler::read_config,
+        handler::update_one,
+        handler::batch_update
+    ),
+    components(schemas(
+        handler::UpdateRequest,
+        handler::BatchRequest,
+        parser::Entry
+    )),
+    tags((name = "config", description = "文档修改接口"))
+)]
+struct ApiDoc;
+```
+
+### 把页面合并进 Router
+
+```rust
+let app = Router::new()
+    .route("/api/config", get(handler::read_config))
+    .route("/api/config/update", post(handler::update_one))
+    .route("/api/config/batch-update", post(handler::batch_update))
+    .with_state(state)
+    .merge(
+        SwaggerUi::new("/swagger-ui/{_:.*}")
+            .url("/api-docs/openapi.json", ApiDoc::openapi())
+    )
+    .layer(cors)
+    .layer(TraceLayer::new_for_http());
+```
+
+部分新版 `utoipa-swagger-ui` 也支持直接写 `SwaggerUi::new("/swagger-ui")`，按你锁定的 crate 版本调整即可。
+
+### 验证
+
+```bash
+cargo run
+```
+
+浏览器打开：
+
+```text
+http://127.0.0.1:8080/swagger-ui/
+```
+
+也可以直接拿 OpenAPI JSON：
+
+```bash
+curl http://127.0.0.1:8080/api-docs/openapi.json
+```
+
+### 两个注意点
+
+1. Swagger UI 页面和 API 同源，所以它本身不需要 CORS；CORS 是给外部前端页面用的。
+2. 如果接口将来加了 token 鉴权，Swagger UI 也要么一起保护，要么只在开发环境启用，别把生产接口说明公开出去。
+
+### 本阶段的遗留问题
+
+OpenAPI 文档和代码是“半自动同步”：结构体改了要重新生成，handler 注解也要跟着改。它很有用，但不是 axum 的内置能力。
+
+---
+
+## 阶段 12.8：加入文件下载接口
+
+### 目标
+
+目录里是 `data/downloads/20231123_164957_AS9283331.xlsx`，调用方只知道 `AS9283331.xlsx` 或 `AS9283331`（也知道类型只有 txt / csv / xls / xlsx），希望一个 GET 就能取到文件。再加一个 `POST /api/download/check`：先问“在不在、有几个”，拿到文件名列表后再决定要不要下载，它和下载接口共用同一套匹配规则。
+
+明确一件事：**不做模糊搜索**。不做“文件名包含就算”、不做正则、不做任意段匹配。只做两级精确比较：
+
+1. 请求名 == 文件完整文件名。
+2. 请求名 == 文件名按 `_` 切分后的最后一段；如果请求没带扩展名，再允许和“末段去扩展名”比较，且扩展名必须在白名单里。
+
+两条规则都命中（比如目录里同时有裸文件和带前缀文件）算**多个候选**，返回 409 并列出全名，绝不让服务端偷偷挑一个。挑错了对方拿到打不开的文件，还很难排查。
+
+### 加依赖
+
+```bash
+cargo add tokio-util --features io
+```
+
+`ReaderStream` 把 `tokio::fs::File` 变成异步字节流，下载时不用把整个文件读进内存。
+
+### 更新 `config.toml`
+
+```toml
+[download]
+enabled = true
+roots = ["./data/downloads"]                # 可配多个；相对路径基于 config.toml 解析
+separator = "_"                             # 末段切分符
+extensions = ["txt", "csv", "xls", "xlsx"]  # 小写、不带点；不在此列表的文件不参与匹配
+case_insensitive = true                     # 统一转小写，抹平 Win / Linux 差异
+max_file_size = 104857600                   # 100 MiB，0 表示不限制
+allow_subdirs = false                       # 只扫顶层
+follow_symlinks = false                     # 跳过符号链接
+```
+
+`extensions` 同时是安全白名单：`.bak`、`.tmp`、`.exe` 根本不进入候选集。这里没有 `strategy` 开关——行为已经定死，少一个配置项就少一种配错的可能。
+
+### 新建 `src/download.rs`
+
+这一层不碰 axum，只负责“校验请求名 + 收集候选”，**不负责挑选**。
+
+```rust
+use crate::config::DownloadConfig;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+/// 请求名必须是单段安全文件名。路由只匹配 {name}，这里再兜一层。
+pub fn validate_requested_name(name: &str) -> Result<(), String> {
+    if name.is_empty() { return Err("文件名不能为空".into()); }
+    if name == "." || name == ".." { return Err("文件名不能是 . 或 ..".into()); }
+    if name.contains('/') || name.contains('\\') { return Err("文件名不能包含路径分隔符".into()); }
+    if name.chars().any(|c| c.is_control()) { return Err("文件名不能包含控制字符".into()); }
+    // 完整版还会拦 Windows 保留设备名 CON / NUL / COM1 ...，见完整指南 5.4。
+    Ok(())
+}
+
+fn strip_ext(name: &str) -> &str {          // 去掉最后一个点之后的部分
+    match name.rfind('.') {
+        Some(i) if i > 0 => &name[..i],
+        _ => name,
+    }
+}
+
+fn key(s: &str, ci: bool) -> String {       // 按配置统一大小写
+    if ci { s.to_lowercase() } else { s.to_string() }
+}
+
+/// 收集所有命中文件；返回的路径都在某个 root 内。
+/// type_filter 为 Some 时只用该扩展名（check 接口用），None 时用配置白名单。
+pub fn find_candidates(
+    cfg: &DownloadConfig, requested: &str, type_filter: Option<&str>,
+) -> Result<Vec<PathBuf>, String> {
+    let wanted = key(requested, cfg.case_insensitive);
+    let wanted_stem = key(strip_ext(requested), cfg.case_insensitive);
+    // 只有请求不带扩展名，才允许“去扩展名比较”，否则 AS9283331.xlsx 会误命中 .csv。
+    let allow_stem = !requested.rfind('.').map(|i| i > 0).unwrap_or(false);
+    let ext_filter: Vec<String> = match type_filter { // 生效的扩展名列表，统一小写
+        Some(t) => vec![t.to_ascii_lowercase()],
+        None => cfg.extensions.iter().map(|e| e.to_ascii_lowercase()).collect(),
+    };
+    let mut out = Vec::new();
+
+    for root in &cfg.roots {
+        let root_abs = Path::new(root).canonicalize()   // 解析成绝对路径
+            .map_err(|e| format!("下载目录不可用: {}: {e}", root))?;
+        scan(&root_abs, &root_abs, cfg, &ext_filter, &wanted, &wanted_stem, allow_stem, &mut out)?;
+    }
+    out.sort();                                        // 固定顺序，409 的列表才稳定
+    out.dedup();                                       // 多个 root 指向同一文件时去重
+    Ok(out)
+}
+
+fn scan(                                               // 递归扫描
+    dir: &Path, root: &Path, cfg: &DownloadConfig, ext_filter: &[String],
+    wanted: &str, wanted_stem: &str, allow_stem: bool,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        // 用 symlink_metadata 才看得出符号链接；默认跳过，防止跳到目录外。
+        let meta = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        if meta.file_type().is_symlink() && !cfg.follow_symlinks { continue; }
+
+        if meta.is_dir() {
+            if cfg.allow_subdirs {
+                let child = path.canonicalize().map_err(|e| e.to_string())?;
+                if child.starts_with(root) {           // 递归前也查一次越界
+                    scan(&child, root, cfg, ext_filter, wanted, wanted_stem, allow_stem, out)?;
+                }
+            }
+            continue;
+        }
+        if !meta.is_file() { continue; }               // 只要普通文件
+        if cfg.max_file_size > 0 && meta.len() > cfg.max_file_size { continue; }
+
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let ext = Path::new(&name).extension().and_then(|s| s.to_str())
+            .unwrap_or("").to_ascii_lowercase();
+        if !ext_filter.is_empty()
+            && !ext_filter.iter().any(|e| e == &ext)
+        { continue; }                                  // 生效的扩展名白名单
+
+        let last = name.rsplit(cfg.separator.as_str()).next().unwrap_or(&name);
+        let full_hit = key(&name, cfg.case_insensitive) == wanted;             // 规则 A
+        let last_hit = key(last, cfg.case_insensitive) == wanted               // 规则 B-1
+            || (allow_stem && key(strip_ext(last), cfg.case_insensitive) == wanted_stem); // B-2
+        if !full_hit && !last_hit { continue; }
+
+        let abs = path.canonicalize().map_err(|e| e.to_string())?;
+        if abs.starts_with(root) { out.push(abs); }    // 命中后最终越界检查
+    }
+    Ok(())
+}
+```
+
+### 改 `src/config.rs`
+
+顶部配置结构体加一个字段：
+
+```rust
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppConfig {
+    pub server: ServerConfig,
+    pub files: FilesConfig,
+    pub allowed_fields: AllowedFields,
+    #[serde(default)]
+    pub cors: CorsConfig,
+    #[serde(default)]                            // 老配置没有 [download] 就是 None
+    pub download: Option<DownloadConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DownloadConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub roots: Vec<String>,
+    #[serde(default = "default_separator")]
+    pub separator: String,
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    #[serde(default = "default_true")]
+    pub case_insensitive: bool,
+    #[serde(default)]
+    pub max_file_size: u64,
+    #[serde(default)]
+    pub allow_subdirs: bool,
+    #[serde(default)]
+    pub follow_symlinks: bool,
+}
+
+fn default_separator() -> String { "_".to_string() }
+fn default_true() -> bool { true }
+```
+
+本阶段的路径解析沿用完整指南的做法：在 `load()` 里先算出配置文件所在目录 `base`，再把 `base_dir` 和 `roots` 都基于它解析。完整 `load()` 如下（相比阶段 8 只多了 `base` 和 `roots` 两块）：
+
+```rust
+pub fn load(path: &Path) -> Result<Self> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("读取配置文件失败: {}", path.display()))?;
+    let mut cfg: AppConfig = toml::from_str(&text)
+        .with_context(|| format!("解析 TOML 失败: {}", path.display()))?;
+
+    let base = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if Path::new(&cfg.files.base_dir).is_relative() {
+        cfg.files.base_dir = base.join(&cfg.files.base_dir).to_string_lossy().into_owned();
+    }
+    if let Some(dl) = cfg.download.as_mut() {
+        for root in &mut dl.roots {
+            if Path::new(root).is_relative() {
+                *root = base.join(&*root).to_string_lossy().into_owned();
+            }
+        }
+    }
+
+    cfg.validate()?;
+    Ok(cfg)
+}
+```
+
+在 `validate()` 里，只有 `enabled = true` 才严格校验：目录存在、`separator` 非空、扩展名小写且不带点。这样老配置升级后不会因为多了个可选段就启动失败。
+
+### 改 `src/handler.rs`
+
+顶部补充引用：
+
+```rust
+use axum::body::Body;
+use axum::extract::{Path as AxumPath, State};   // 别名避开 std::path::Path
+use axum::http::header::CONTENT_DISPOSITION;
+use axum::http::{HeaderValue, StatusCode};
+use tokio::fs::File;
+use tokio_util::io::ReaderStream;
+
+use crate::download;
+```
+
+请求体结构体（`type` 是 Rust 关键字，用 serde 改名；`default` 让它可以省略）：
+
+```rust
+#[derive(Debug, Deserialize)]
+pub struct CheckRequest {
+    pub name: String,
+    #[serde(rename = "type", default)]
+    pub file_type: Option<String>,
+}
+```
+
+新增 handler：
+
+```rust
+pub async fn download_file(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    let Some(dl) = state.config.download.as_ref().filter(|d| d.enabled) else {
+        return not_found("下载接口未启用");
+    };
+    if let Err(e) = download::validate_requested_name(&name) {
+        return bad_request(&format!("文件名非法: {e}"));
+    }
+
+    let candidates = match download::find_candidates(dl, &name, None) { // GET 不额外限定类型
+        Ok(v) => v,
+        Err(e) => return server_error(&e),
+    };
+
+    match candidates.len() {                       // 三态判定
+        0 => not_found(&format!("未找到匹配文件: {name}")),
+        1 => {
+            let path = &candidates[0];
+            let file = match File::open(path).await {
+                Ok(f) => f,
+                Err(e) => return server_error(&format!("打开下载文件失败: {e}")),
+            };
+            let mut resp = Response::new(Body::from_stream(ReaderStream::new(file)));
+            let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("download");
+            let disposition = format!("attachment; filename=\"{file_name}\"");
+            resp.headers_mut().insert(
+                CONTENT_DISPOSITION,
+                HeaderValue::from_str(&disposition).unwrap_or(HeaderValue::from_static("attachment")),
+            );
+            resp
+        }
+        _ => {
+            let list: Vec<String> = candidates.iter()
+                .map(|p| p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string())
+                .collect();
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "ok": false,
+                    "error": "匹配到多个文件，请使用完整文件名重试",
+                    "candidates": list,
+                })),
+            ).into_response()
+        }
+    }
+}
+
+/// POST /api/download/check —— 只回答“在不在、有几个”，复用同一套匹配规则。
+pub async fn check_download(
+    State(state): State<AppState>,
+    Json(req): Json<CheckRequest>,
+) -> Response {
+    let Some(dl) = state.config.download.as_ref().filter(|d| d.enabled) else {
+        return not_found("下载接口未启用");
+    };
+    if let Err(e) = download::validate_requested_name(&req.name) {
+        return bad_request(&format!("name 非法: {e}"));
+    }
+    // type 必须是白名单的子集，不能绕过 extensions 限制。
+    if let Some(t) = &req.file_type {
+        if !dl.extensions.iter().any(|e| e.eq_ignore_ascii_case(t.trim())) {
+            return bad_request(&format!("type 不在允许列表中: {t}"));
+        }
+    }
+    let type_filter = req.file_type.as_deref().map(|t| t.trim().to_ascii_lowercase());
+    let candidates = match download::find_candidates(dl, &req.name, type_filter.as_deref()) {
+        Ok(v) => v,
+        Err(e) => return server_error(&e),
+    };
+
+    let mut files: Vec<String> = candidates.iter()
+        .filter_map(|p| p.file_name().and_then(|s| s.to_str()).map(|s| s.to_string()))
+        .collect();
+    files.sort();
+    files.dedup();                                     // 按文件名去重，不同 root 同名只算一个
+    let count = files.len();
+    let exist = count > 0;
+
+    Json(json!({                                       // 固定三字段，exist=false 也是 200
+        "exist": exist,
+        "count": count,
+        "files": files,
+    })).into_response()
+}
+
+fn not_found(msg: &str) -> Response {
+    (StatusCode::NOT_FOUND, Json(json!({ "ok": false, "error": msg }))).into_response()
+}
+```
+
+### 改 `src/main.rs`
+
+模块声明加 `mod download;`。路由要在 `with_state` 之前按开关决定是否注册，因为 `state` 随后会被移走：
+
+```rust
+let download_enabled = config
+    .download.as_ref()
+    .is_some_and(|d| d.enabled);
+let state = AppState::new(config);                  // config 被移入 Arc
+
+let app = Router::new()
+    .route("/api/config", get(handler::read_config))
+    .route("/api/config/update", post(handler::update_one))
+    .route("/api/config/batch-update", post(handler::batch_update));
+
+let app = if download_enabled {
+    app.route("/download/{name}", get(handler::download_file))
+       .route("/api/download/check", post(handler::check_download))
+} else {
+    app
+};
+
+let app = app
+    .with_state(state)
+    .layer(cors)
+    .layer(TraceLayer::new_for_http());
+```
+
+### 验证
+
+准备 `data/downloads/20231123_164957_AS9283331.xlsx`，然后：
+
+```bash
+# 末段 + 扩展名 → 200
+curl -OJ http://127.0.0.1:8080/download/AS9283331.xlsx
+
+# 只给 ID → 200（扩展名由白名单限定）
+curl -OJ http://127.0.0.1:8080/download/AS9283331
+
+# 完整文件名 → 200
+curl -OJ http://127.0.0.1:8080/download/20231123_164957_AS9283331.xlsx
+```
+
+再放一个 `20231123_164957_AS9283331.csv`，只给 ID 的请求应该变成 409：
+
+```json
+{"ok":false,"error":"匹配到多个文件，请使用完整文件名重试","candidates":["20231123_164957_AS9283331.csv","20231123_164957_AS9283331.xlsx"]}
+```
+
+查询接口不下载文件，只返回清单，`files` 永远是数组：
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/download/check \
+  -H "Content-Type: application/json" \
+  -d '{"name":"AS9283331","type":"xlsx"}'
+```
+
+```json
+{"exist":true,"count":1,"files":["20231123_164957_AS9283331.xlsx"]}
+```
+
+`type` 省略时返回所有匹配类型；`exist: false` 时是 `{"exist":false,"count":0,"files":[]}`，状态码仍是 200。
+
+### 本阶段的遗留问题
+
+- 每次请求都重新扫描 `roots`，目录文件上千时会慢；最终版可以加启动期索引，但刷新时仍要做符号链接与越界检查。
+- 不支持 Range，浏览器 PDF 内联预览会受限；当前用 `attachment` 强制下载，所以不阻塞主流程。
+- 中文文件名还没做 RFC 5987 编码，完整指南里用 `filename*=` 补上了。
+- 下载和 check 接口都不做代码鉴权，靠网络隔离：`host` 绑具体内网 IP，或用防火墙只放行内网网段；上线前从外网验证端口不可达。
 
 ---
 
@@ -1246,16 +1816,20 @@ CORS 只解决浏览器同源策略，**不是鉴权**。任何 curl / Postman �
 10. 备份 + 临时文件 + 原子替换。
 11. JSON 日志 + 请求日志。
 12. CORS。
+13. Swagger UI / OpenAPI（可选增强，默认不在最终方案里）。
+14. 文件下载与存在性查询：全名精确 + 末段精确两级匹配，多候选返回 409；check 接口复用同一套规则，带可选 `type` 过滤。
 
 接下来请把教程代码**整体替换成最终版本**：
 
 - 最终文档：[`Axum配置接口_完整实现与打包指南.md`](./Axum配置接口_完整实现与打包指南.md)
-- 最终版本包含阶段 12 没有补齐的内容：
+- 最终版本包含中间阶段没有补齐的内容：
   - 相对 `base_dir` 基于 `config.toml` 解析。
   - 启动期检查目标文档是否存在。
   - 重复的 `@字段` 直接拒绝修改。
   - 值不能包含换行或以 `@` 开头。
   - 统一的 JSON 错误响应。
+  - 下载侧额外拦截 Windows 保留设备名，中文文件名按 RFC 5987 编码。
+  - 下载候选路径的符号链接 / 越界检查与 `download.*` 日志留痕齐全。
   - 完整的逐行中文注释。
   - 四平台 CI 与 Release 打包。
 

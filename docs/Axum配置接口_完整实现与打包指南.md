@@ -2,7 +2,7 @@
 
 ## 0. 项目目标与工具链对照
 
-**功能**：Windows / Linux / macOS 上跑一个 HTTP 服务，通过接口修改指定目录下 txt 文档中 `@字段名` 下面的值。目录路径、文件名、可改字段白名单全部由 `config.toml` 控制。接口采用**方案 A**（单字段 + 批量 `items` 数组）。
+**功能**：Windows / Linux / macOS 上跑一个 HTTP 服务，做两件事：一是通过接口修改指定目录下 txt 文档中 `@字段名` 下面的值，目录路径、文件名、可改字段白名单全部由 `config.toml` 控制，写接口采用**方案 A**（单字段 + 批量 `items` 数组）；二是通过 `GET /download/{name}` 从配置的下载目录中取文件，通过 `POST /api/download/check` 先查询是否存在；两者共用「全名精确」和「末段精确」两级匹配，**不做模糊搜索**。
 
 **项目名**：`config-api`。
 
@@ -96,9 +96,10 @@ cargo add tracing
 cargo add tracing-subscriber --features env-filter,json
 cargo add anyhow
 cargo add tempfile
+cargo add tokio-util --features io
 ```
 
-- **axum**：Web 框架，定位类似 FastAPI。本方案只处理 JSON，不需要 `multipart` feature。
+- **axum**：Web 框架，定位类似 FastAPI。本方案只处理 JSON 请求和文件下载，不需要 `multipart` feature（那是上传用的）。
 - **tokio**：异步运行时；`full` 包含 `#[tokio::main]`、net、sync 等。
 - **serde / serde_json**：请求体 JSON 与 Rust 结构体转换，承担 pydantic 的解析职责。
 - **toml**：解析 `config.toml`。
@@ -107,10 +108,11 @@ cargo add tempfile
 - **tracing-subscriber**：日志输出实现；`json` feature 让日志变成 JSON Lines。
 - **anyhow**：简化应用层错误链。
 - **tempfile**：写临时文件并 `persist` 到目标路径，实现跨平台原子替换。
+- **tokio-util**：提供 `ReaderStream`，把 `tokio::fs::File` 变成异步字节流；只启用 `io` feature，下载大文件时不必一次性读进内存。
 
 接口可能由浏览器页面调用，因此默认启用 CORS，但**不允许硬编码 `*` 加凭证**。允许来源写在 `config.toml` 的 `[cors]` 段里，preflight `OPTIONS` 由 `CorsLayer` 自动处理，不需要单独写路由。
 
-再次强调：CORS 只解决浏览器同源策略，不是鉴权。一旦监听 `0.0.0.0`，仍必须在上线前加访问控制。
+再次强调：CORS 只解决浏览器同源策略，不是鉴权。本方案不在代码里做鉴权，靠网络隔离保护：`host` 尽量绑具体内网 IP；必须写 `0.0.0.0` 时用防火墙限制来源网段，并在上线前从外网验证端口不可达。
 
 首次 `cargo build` 下载并编译依赖需要几分钟属正常现象；只做类型检查用 `cargo check`，更快。
 
@@ -138,6 +140,16 @@ fields = ["Thickness", "Temper", "Alloy", "Entry Width", "Exit Width", "DataName
 allowed_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
 # 只有使用 Cookie / Authorization 等凭证时才设为 true；此时 allowed_origins 不能包含 "*"。
 allow_credentials = false
+
+[download]
+enabled = true                              # false 时不注册 /download 路由
+roots = ["./data/downloads"]                # 可配多个；相对路径基于本 config.toml 解析
+separator = "_"                             # 末段切分符，见下方「下载匹配规则」
+extensions = ["txt", "csv", "xls", "xlsx"]  # 小写、不带点；不在此列表的文件不参与匹配
+case_insensitive = true                     # 统一转小写比较，抹平 Windows / Linux 差异
+max_file_size = 104857600                   # 单文件大小上限（字节），0 表示不限制
+allow_subdirs = false                       # false 只扫描 root 顶层，true 递归子目录
+follow_symlinks = false                     # false 跳过符号链接 / junction
 ```
 
 ### 路径规则
@@ -152,6 +164,50 @@ allow_credentials = false
 - `allowed_origins = ["*"]`：允许任意来源；仅适合无鉴权的内网工具演示。
 - `allow_credentials = true` 时，`allowed_origins` 必须是明确来源，不能写 `"*"`。
 - 预检请求（`OPTIONS`）由 `CorsLayer` 自动应答，应用代码不需要写 `/api/...` 的 `options` 路由。
+
+### 下载匹配规则
+
+接口是 `GET /download/{name}`，`name` 必须是**单段文件名**。服务端先在 `roots` 里筛出候选文件，再做两级**精确比较**，没有包含匹配、正则或任意段匹配：
+
+1. **全名精确**：`name == 文件完整文件名`，例如 `20231123_164957_AS9283331.xlsx`。
+2. **末段精确**：把文件名按 `separator` 切成多段，取最后一段 `last`；满足任一即命中：
+   - `name == last`，例如请求 `AS9283331.xlsx` 命中 `20231123_164957_AS9283331.xlsx` 的末段；
+   - **仅当请求不带扩展名时**，`name == last` 去扩展名后的部分，例如请求 `AS9283331` 命中 `..._AS9283331.xlsx`；此时该文件的扩展名必须在 `extensions` 里。
+
+请求带扩展名时只做“带扩展名的精确比较”，不会拿 `AS9283331.xlsx` 去命中 `..._AS9283331.csv`；`xls` 与 `xlsx` 也不会互相命中。
+
+`case_insensitive = true` 时，上述比较统一转小写。文件名不含 `separator` 时 `last` 就是整个文件名，所以裸文件 `AS9283331.xlsx` 同样能被命中。
+
+候选数量的处理是固定的：
+
+| 候选数 | 状态码 | 响应 |
+|---|---|---|
+| 0 | 404 | `{"ok":false,"error":"未找到匹配文件: X"}` |
+| 1 | 200 | 文件字节流 + `Content-Disposition: attachment` |
+| ≥2 | 409 | `{"ok":false,"error":"匹配到多个文件，请使用完整文件名重试","candidates":[...]}` |
+
+**多候选一律报错，绝不静默选第一个。** 目录里同时有 `AS9283331.xlsx` 和 `20231123_164957_AS9283331.xlsx` 时，请求 `AS9283331.xlsx` 会同时命中两级规则，返回 409 并列出两个全名。`xls` 与 `xlsx` 也必须严格区分，请求只给 `AS9283331` 而两种扩展名都存在时同样是 409。
+
+不在 `extensions` 里的文件（`.bak`、`.tmp`、`.exe` 等）根本不进入候选集，因此既不会被匹配，也不会被下载。`extensions = []` 表示不按扩展名过滤，但那样会放大暴露面，生产环境不建议。
+
+### 存在性查询
+
+`POST /api/download/check` 复用上面的匹配规则，只回答“在不在、有几个”，不返回文件内容。请求体：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `name` | string | 是 | 文件标识，单段，不含路径分隔符 |
+| `type` | string | 否 | 扩展名，如 `xls`；必须是配置 `extensions` 里的值 |
+
+响应固定三个字段：`exist`、`count`、`files`，其中 `files` 永远是数组，`count` 永远是数字：
+
+```json
+{"exist": true, "count": 1, "files": ["20231209_120312_A12331.xls"]}
+{"exist": true, "count": 2, "files": ["20231209_120312_A12331.xls", "20231209_120312_A12331.xlsx"]}
+{"exist": false, "count": 0, "files": []}
+```
+
+合法请求一律 200（`exist: false` 不是 404）；`name` 非法或 `type` 不在白名单时返回 400。带 `type` 也可能返回多个文件——比如两个不同前缀的 `.xls`——所以 `count` 和数组始终保留。`files` 按文件名去重，两个 root 下的同名文件只算一个。
 
 ### 文档格式
 
@@ -189,7 +245,7 @@ use anyhow::{anyhow, Context, Result}; // anyhow! 造错；Context 给错误加�
 use serde::Deserialize;                // 提供 #[derive(Deserialize)]，让结构体能从 TOML 反序列化
 use std::path::{Path, PathBuf};        // Path 是借用路径；PathBuf 是拥有所有权的路径
 
-/// 顶层配置结构：对应 config.toml 里的四个段
+/// 顶层配置结构：对应 config.toml 里的五个段
 #[derive(Debug, Clone, Deserialize)] // Debug 便于打印；Clone 便于 Arc 共享；Deserialize 用于解析 TOML
 #[serde(deny_unknown_fields)]        // 配置里写错键名直接启动失败，而不是被静默忽略
 pub struct AppConfig {               // 聚合所有配置，供服务全局只读使用
@@ -198,6 +254,8 @@ pub struct AppConfig {               // 聚合所有配置，供服务全局只�
     pub allowed_fields: AllowedFields, // [allowed_fields] 可写字段白名单
     #[serde(default)]                // 老配置没有 [cors] 段时，用 Default 兜底
     pub cors: CorsConfig,            // [cors] 浏览器跨域配置
+    #[serde(default)]                // 老配置没有 [download] 段时视为 None，不启用下载
+    pub download: Option<DownloadConfig>, // [download] 下载目录与匹配规则；None 表示不启用
 }
 
 /// 服务监听配置
@@ -235,6 +293,30 @@ pub struct CorsConfig {                      // 只放 CORS 必需的两项
     pub allow_credentials: bool,             // 是否允许 Cookie / Authorization 等凭证
 }
 
+/// 下载配置
+#[derive(Debug, Clone, Deserialize)]          // 可打印、可克隆、可反序列化
+#[serde(deny_unknown_fields)]                // 拼错下载键会启动失败
+pub struct DownloadConfig {                  // 控制“从哪些目录、按什么规则取文件”
+    #[serde(default)]                        // 省略 enabled 时视为 false，避免误开下载
+    pub enabled: bool,                       // 总开关；false 时不注册路由
+    pub roots: Vec<String>,                  // 允许的目录；相对路径在 load() 里改写
+    #[serde(default = "default_separator")]  // 省略 separator 时用 "_"
+    pub separator: String,                   // 末段切分符
+    #[serde(default)]                        // 省略 extensions 时视为 []（不按类型过滤）
+    pub extensions: Vec<String>,             // 小写、不带点；空数组不过滤
+    #[serde(default = "default_true")]       // 省略时默认 true
+    pub case_insensitive: bool,              // 比较时是否忽略大小写
+    #[serde(default)]                        // 省略时视为 0，即不限制
+    pub max_file_size: u64,                  // 单文件大小上限（字节）
+    #[serde(default)]                        // 省略时只看顶层
+    pub allow_subdirs: bool,                 // 是否递归子目录
+    #[serde(default)]                        // 省略时拒绝符号链接
+    pub follow_symlinks: bool,               // 是否跟随符号链接
+}
+
+fn default_separator() -> String { "_".to_string() } // serde 默认值工厂
+fn default_true() -> bool { true }                   // serde 默认值工厂
+
 impl AppConfig {                     // 把“加载 + 校验 + 取值”集中在这个 impl 里
     /// 读取配置，解析相对路径，然后立即做业务校验。
     pub fn load(path: &Path) -> Result<Self> { // 入参是配置文件路径；返回配置或错误
@@ -254,6 +336,18 @@ impl AppConfig {                     // 把“加载 + 校验 + 取值”集中�
                 .to_string_lossy() // 路径转字符串；非 UTF-8 字节会被替换成 U+FFFD
                 .into_owned(); // 从 Cow 拿到 String 所有权
         }
+
+        // 下载目录同样是相对路径时，也基于配置文件所在目录解析，规则和 base_dir 一致。
+        if let Some(dl) = cfg.download.as_mut() { // 只有配置了 [download] 才处理
+            for root in &mut dl.roots {           // 逐个改写
+                if Path::new(root).is_relative() { // 只处理相对路径
+                    *root = base                   // 配置文件所在目录
+                        .join(&*root)              // 拼出实际目录
+                        .to_string_lossy()         // 转字符串
+                        .into_owned();             // 拿所有权
+                }                                  // if 结束
+            }                                      // for 结束
+        }                                          // if let 结束
 
         cfg.validate()?; // 启动期校验；失败则整个 main 直接退出
         Ok(cfg)          // 校验通过，返回最终配置
@@ -287,6 +381,31 @@ impl AppConfig {                     // 把“加载 + 校验 + 取值”集中�
         if !file.is_file() { // 文件不存在或不是普通文件
             return Err(anyhow!("目标文档不存在或不是文件: {}", file.display())); // 不等请求来了再失败
         }
+
+        // 下载配置：只有 enabled=true 才严格要求，避免老配置升级后启动失败。
+        if let Some(dl) = &self.download { // 取下载配置的只读引用
+            if dl.enabled {                // 只有启用才校验细节
+                if dl.roots.is_empty() {   // 没有目录等于接口永远 404
+                    return Err(anyhow!("download.roots 不能为空")); // 提前暴露错误
+                }
+                if dl.separator.is_empty() { // 空分隔符会让末段切分失去意义
+                    return Err(anyhow!("download.separator 不能为空")); // 拒绝启动
+                }
+                for ext in &dl.extensions { // 逐项检查扩展名
+                    if ext.is_empty() || ext.contains('.') { // 要求小写、不带点
+                        return Err(anyhow!("download.extensions 必须是小写且不带点的扩展名: {ext}")); // 报错
+                    }                      // if 结束
+                }                          // for 结束
+                for root in &dl.roots {    // 逐个检查目录
+                    let dir = Path::new(root); // 转成 Path 视图
+                    if !dir.is_dir() {     // 目录不存在或不是目录
+                        return Err(anyhow!("download.roots 不存在或不是目录: {}", dir.display())); // 明确报错
+                    }                      // if 结束
+                    dir.canonicalize()     // 解析成绝对路径，供运行时做前缀校验
+                        .with_context(|| format!("解析下载目录失败: {}", dir.display()))?; // 失败附路径
+                }                          // for 结束
+            }                              // if 结束
+        }                                  // if let 结束
         Ok(()) // 所有校验通过
     }
 
@@ -466,11 +585,195 @@ pub fn apply_to_text(                       // 主函数：返回 (新文本, �
 }                                            // apply_to_text 结束
 ```
 
-### 5.4 `src/handler.rs` —— 三个接口
+### 5.4 `src/download.rs` —— 文件名校验与候选收集
+
+这一层不依赖 axum，只做纯逻辑：先判断请求名是否安全，再在配置的目录里收集所有命中的文件。**它不负责选哪个，只负责给出候选集合**，三态判定留给 handler。
 
 ```rust
-use axum::extract::{Json, State}; // Json 解析请求体；State 取出共享状态
-use axum::http::StatusCode;       // HTTP 状态码，如 400 / 500
+use crate::config::DownloadConfig; // 下载配置
+use std::fs;                       // 读目录与元数据
+use std::path::{Path, PathBuf};    // 路径类型
+
+/// 请求文件名不合法的原因
+#[derive(Debug)]                   // 便于日志打印
+pub enum NameError {               // 所有拒绝理由
+    Empty,                         // 空字符串
+    DotOrDotDot,                   // . 或 ..
+    HasSeparator,                  // 含 / 或 \
+    HasControl,                    // 含控制字符或 NUL
+    DeviceName,                    // Windows 保留设备名
+}
+
+impl std::fmt::Display for NameError { // 实现 Display 才能 to_string()
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { // 格式化入口
+        match self {               // 按原因分支
+            Self::Empty => write!(f, "文件名不能为空"), // 空串
+            Self::DotOrDotDot => write!(f, "文件名不能是 . 或 .."), // 相对路径 tricks
+            Self::HasSeparator => write!(f, "文件名不能包含路径分隔符"), // 防目录穿越
+            Self::HasControl => write!(f, "文件名不能包含控制字符"), // 防 NUL 注入
+            Self::DeviceName => write!(f, "文件名不能使用 Windows 保留设备名"), // 设备名
+        }                          // match 结束
+    }                              // fmt 结束
+}                                  // impl 结束
+
+/// 请求名必须是单段安全文件名。路由只匹配 {name}，这里再兜一层。
+pub fn validate_requested_name(name: &str) -> Result<(), NameError> {
+    if name.is_empty() {           // 空串
+        return Err(NameError::Empty); // 拒绝
+    }                              // if 结束
+    if name == "." || name == ".." { // 相对路径
+        return Err(NameError::DotOrDotDot); // 拒绝
+    }                              // if 结束
+    if name.contains('/') || name.contains('\\') { // 两种分隔符都拦
+        return Err(NameError::HasSeparator); // 拒绝
+    }                              // if 结束
+    if name.chars().any(|c| c.is_control()) { // NUL 与其他控制字符
+        return Err(NameError::HasControl); // 拒绝
+    }                              // if 结束
+    let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase(); // 设备名只看主名
+    const DEVICES: &[&str] = &[     // Windows 保留设备名
+        "CON", "PRN", "AUX", "NUL", // 四个基础名
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", // 串口
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", // 并口
+    ];                             // 常量结束
+    if DEVICES.contains(&stem.as_str()) { // 命中保留名
+        return Err(NameError::DeviceName); // 拒绝
+    }                              // if 结束
+    Ok(())                         // 校验通过
+}                                  // 函数结束
+
+/// 去掉最后一个点及其后的扩展名；没有点或以点开头时原样返回。
+fn strip_ext(name: &str) -> &str { // 输入文件名，输出主名切片
+    match name.rfind('.') {        // 找最后一个点
+        Some(i) if i > 0 => &name[..i], // 有扩展名，截掉
+        _ => name,                 // 没有或不合法，原样
+    }                              // match 结束
+}                                  // 函数结束
+
+/// 按配置决定是否转小写，统一比较口径。
+fn compare_key(s: &str, case_insensitive: bool) -> String { // 返回比较用的字符串
+    if case_insensitive { s.to_lowercase() } else { s.to_string() } // 分支
+}                                  // 函数结束
+
+/// 请求名是否自带扩展名。决定是否允许“去扩展名比较”。
+fn has_extension(name: &str) -> bool { // 输入请求名
+    name.rfind('.').map(|i| i > 0).unwrap_or(false) // 点不在开头才算扩展名
+}                                  // 函数结束
+
+/// 收集所有命中文件；返回路径已 canonicalize，且都在某个 root 内。
+/// type_filter 为 Some 时只用该扩展名（check 接口用），None 时用配置的 extensions。
+/// 出错只表示目录不可读，不表示“没找到”。
+pub fn find_candidates(            // 候选收集主函数
+    config: &DownloadConfig,       // 下载配置
+    requested: &str,               // 请求名
+    type_filter: Option<&str>,     // 可选扩展名过滤；GET 下载传 None
+) -> Result<Vec<PathBuf>, String> { // 成功返回候选路径，失败返回服务端错误文案
+    let wanted = compare_key(requested, config.case_insensitive); // 全名/末段的比较键
+    let wanted_stem = compare_key(strip_ext(requested), config.case_insensitive); // 主名比较键
+    let allow_stem_match = !has_extension(requested); // 只有请求不带扩展名才允许主名匹配
+
+    // 生效的扩展名白名单：带 type 时只用它，否则用配置值；两种都统一小写。
+    let ext_filter: Vec<String> = match type_filter { // 按是否带 type 分支
+        Some(t) => vec![t.to_ascii_lowercase()],     // 只用请求指定的类型
+        None => config.extensions.iter().map(|e| e.to_ascii_lowercase()).collect(), // 用配置白名单
+    };                                 // match 结束
+    let mut out = Vec::new();       // 收集候选
+
+    for root in &config.roots {     // 逐个目录扫描
+        let root_abs = Path::new(root) // 配置里已解析成绝对路径
+            .canonicalize()          // 再规范化一次，确保前缀判断可靠
+            .map_err(|e| format!("下载目录不可用: {}: {e}", root))?; // 失败转服务端错误
+        scan_dir(&root_abs, &root_abs, config, &ext_filter, &wanted, &wanted_stem, allow_stem_match, &mut out)?; // 扫描
+    }                              // for 结束
+
+    out.sort();                    // 固定顺序，保证 409 的 candidates 稳定
+    out.dedup();                   // 多个 root 指向同一文件时去重
+    Ok(out)                        // 返回候选
+}                                  // 函数结束
+
+/// 递归扫描；dir 是当前目录，root_abs 是最初的允许根目录。
+fn scan_dir(                       // 内部扫描函数
+    dir: &Path,                    // 当前目录
+    root_abs: &Path,               // 允许的根目录，用于越界检查
+    config: &DownloadConfig,       // 下载配置
+    ext_filter: &[String],         // 生效的扩展名白名单（已小写）
+    wanted: &str,                  // 请求名比较键
+    wanted_stem: &str,             // 请求主名比较键
+    allow_stem_match: bool,        // 是否允许去扩展名匹配
+    out: &mut Vec<PathBuf>,        // 候选收集器
+) -> Result<(), String> {          // 成功或服务端错误
+    let entries = fs::read_dir(dir) // 读目录项
+        .map_err(|e| format!("读取下载目录失败: {}: {e}", dir.display()))?; // 失败转错误
+    for entry in entries {         // 逐项处理
+        let entry = entry.map_err(|e| format!("读取目录项失败: {e}"))?; // 单项读取失败
+        let path = entry.path();   // 完整路径
+        let meta = fs::symlink_metadata(&path) // 用 symlink_metadata 才看得出符号链接
+            .map_err(|e| format!("读取文件元数据失败: {}: {e}", path.display()))?; // 失败转错误
+
+        if meta.file_type().is_symlink() && !config.follow_symlinks { // 默认跳过符号链接
+            continue;              // 防止跳到目录外
+        }                          // if 结束
+        if meta.is_dir() {         // 子目录
+            if config.allow_subdirs { // 允许递归
+                let child = path.canonicalize() // 先规范化
+                    .map_err(|e| format!("解析子目录失败: {}: {e}", path.display()))?; // 失败转错误
+                if !child.starts_with(root_abs) { // 越界保护
+                    continue;      // 跳过
+                }                  // if 结束
+                scan_dir(&child, root_abs, config, ext_filter, wanted, wanted_stem, allow_stem_match, out)?; // 递归
+            }                      // if 结束
+            continue;              // 目录本身不是候选
+        }                          // if 结束
+        if !meta.is_file() {       // 只要普通文件
+            continue;              // 跳过设备、管道等
+        }                          // if 结束
+        if config.max_file_size > 0 && meta.len() > config.max_file_size { // 超过上限
+            tracing::warn!(file = %path.display(), "文件超过 download.max_file_size，已跳过"); // 留痕
+            continue;              // 不进入候选
+        }                          // if 结束
+
+        let file_name = entry.file_name().to_string_lossy().into_owned(); // 文件名转 String
+        let ext = Path::new(&file_name) // 用路径视图取扩展名
+            .extension()           // 可能是 None
+            .and_then(|s| s.to_str()) // 非 UTF-8 则跳过该项
+            .unwrap_or("")         // 没有扩展名视为空串
+            .to_ascii_lowercase(); // 统一小写比较
+        if !ext_filter.is_empty()  // 白名单非空时
+            && !ext_filter.iter().any(|e| e == &ext) // 不在生效列表里（已统一小写）
+        {                          // 组合条件
+            continue;              // 不进入候选
+        }                          // if 结束
+
+        let last = file_name       // 取末段
+            .rsplit(config.separator.as_str()) // 按分隔符从右切
+            .next()                // 第一段就是末段
+            .unwrap_or(&file_name); // 理论上不会失败
+        let full_hit = compare_key(&file_name, config.case_insensitive) == wanted; // 规则 A
+        let last_hit = compare_key(last, config.case_insensitive) == wanted // 规则 B-1
+            || (allow_stem_match // 规则 B-2：仅请求不带扩展名时启用
+                && compare_key(strip_ext(last), config.case_insensitive) == wanted_stem); // 主名相等
+        if !full_hit && !last_hit { // 两条规则都没命中
+            continue;              // 跳过
+        }                          // if 结束
+
+        let abs = path.canonicalize() // 命中后再规范化一次
+            .map_err(|e| format!("解析候选文件失败: {}: {e}", path.display()))?; // 失败转错误
+        if !abs.starts_with(root_abs) { // 最终越界检查
+            continue;              // 拒绝目录外文件
+        }                          // if 结束
+        out.push(abs);             // 加入候选
+    }                              // for 结束
+    Ok(())                         // 扫描完成
+}                                  // 函数结束
+```
+
+### 5.5 `src/handler.rs` —— 五个接口
+
+```rust
+use axum::body::Body;             // 流式响应体
+use axum::extract::{Json, Path as AxumPath, State}; // Path 提取器用别名，避开 std::path::Path
+use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE}; // 下载响应头
+use axum::http::{HeaderValue, StatusCode}; // HeaderValue 构造响应头；StatusCode 是状态码
 use axum::response::{IntoResponse, Response}; // 把元组 / Json 转成统一 Response
 use serde::Deserialize;           // 请求体反序列化派生宏
 use serde_json::json;             // 快速构造 JSON 值
@@ -478,7 +781,10 @@ use std::fs;                      // 同步文件读写
 use std::io::Write;               // write_all 方法所在 trait
 use std::path::Path;              // 路径借用类型
 use tempfile::NamedTempFile;      // 同目录临时文件，用于原子替换
+use tokio::fs::File;              // 异步打开文件，供流式下载
+use tokio_util::io::ReaderStream; // 把 File 包装成异步字节流
 
+use crate::download;              // 文件名校验与候选收集模块
 use crate::parser;                // 文档解析与最小改动写入模块
 use crate::state::AppState;       // 共享状态类型
 
@@ -493,6 +799,14 @@ pub struct UpdateRequest {        // 对应单字段更新接口
 #[derive(Debug, Deserialize)]     // 同上
 pub struct BatchRequest {         // 对应批量更新接口
     pub items: Vec<UpdateRequest>, // 多条更新；空数组会被拒绝
+}                                 // 结构体结束
+
+/// 下载检查请求体：{ "name": "A12331", "type": "xls" }
+#[derive(Debug, Deserialize)]     // 可打印；从 JSON 请求体反序列化
+pub struct CheckRequest {         // 对应 POST /api/download/check
+    pub name: String,             // 文件标识；必填，单段安全文件名
+    #[serde(rename = "type", default)] // type 是 Rust 关键字，且允许省略
+    pub file_type: Option<String>, // 可选扩展名；必须是配置 extensions 的子集
 }                                 // 结构体结束
 
 /// GET /api/config —— 读取当前文档解析结果
@@ -613,6 +927,190 @@ async fn apply_updates(                                 // 写文档的唯一入
     }))                                                 // Ok(Value)
 }                                                       // apply_updates 结束
 
+/// GET /download/{name} —— 从配置目录取文件。
+/// 两级精确匹配；0 个候选 404，1 个流式返回，多个 409 不猜。
+pub async fn download_file(                             // 下载 handler
+    State(state): State<AppState>,                      // 注入共享状态
+    AxumPath(name): AxumPath<String>,                   // 单段文件名，由 axum 先做路径切分
+) -> Response {                                          // 返回统一 Response
+    let Some(dl) = state.config.download.as_ref().filter(|d| d.enabled) else { // 未启用时兜底
+        return not_found("下载接口未启用");              // 404
+    };                                                  // let-else 结束
+
+    if let Err(e) = download::validate_requested_name(&name) { // 文件名合法性
+        return bad_request(&format!("文件名非法: {e}")); // 400
+    }                                                   // if 结束
+
+    let candidates = match download::find_candidates(dl, &name, None) { // 收集候选；GET 不额外限定类型
+        Ok(v) => v,                                     // 收集成功
+        Err(e) => return server_error(&e),              // 目录不可读转 500
+    };                                                  // match 结束
+
+    match candidates.len() {                            // 三态判定
+        0 => {                                          // 没有候选
+            tracing::info!(action = "download.miss", name = %name, "未找到匹配文件"); // 留痕
+            not_found(&format!("未找到匹配文件: {name}")) // 404
+        }                                               // 分支结束
+        1 => {                                          // 唯一候选
+            let path = &candidates[0];                  // 借用候选路径
+            let file = match File::open(path).await {   // 异步打开文件
+                Ok(f) => f,                             // 打开成功
+                Err(e) => return server_error(&format!("打开下载文件失败: {e}")), // 失败转 500
+            };                                          // match 结束
+            let body = Body::from_stream(ReaderStream::new(file)); // 流式响应体，不整文件入内存
+            let file_name = path                        // 取文件名用于响应头
+                .file_name()                            // Option<&OsStr>
+                .and_then(|s| s.to_str())               // 非 UTF-8 时用兜底名
+                .unwrap_or("download");                 // 兜底
+            let mime = mime_for(path);                  // 按扩展名选 Content-Type
+
+            let mut resp = Response::new(body);         // 构造 200 响应
+            *resp.status_mut() = StatusCode::OK;        // 显式设置状态码
+            resp.headers_mut().insert(                  // 写 Content-Type
+                CONTENT_TYPE,                           // 头名
+                HeaderValue::from_static(mime),         // 静态值
+            );                                          // insert 结束
+            resp.headers_mut().insert(                  // 写 Content-Disposition
+                CONTENT_DISPOSITION,                    // 头名
+                HeaderValue::from_str(&content_disposition(file_name)) // 动态值可能含非 ASCII
+                    .unwrap_or_else(|_| HeaderValue::from_static("attachment")), // 极端情况兜底
+            );                                          // insert 结束
+
+            tracing::info!(                             // 业务日志
+                action = "download.ok",                 // 事件名
+                name = %name,                           // 请求名
+                file = %path.display(),                 // 实际文件
+                "文件下载成功"                           // 正文
+            );                                          // 宏结束
+            resp                                        // 返回响应
+        }                                               // 分支结束
+        _ => {                                          // 多个候选
+            let list: Vec<String> = candidates.iter()   // 遍历候选
+                .map(|p| p                              // 每个路径
+                    .file_name()                        // 取文件名
+                    .and_then(|s| s.to_str())           // 转 &str
+                    .unwrap_or("")                      // 兜底空串
+                    .to_string())                       // 转 String
+                .collect();                             // 收集成列表
+            tracing::warn!(                             // 歧义也要留痕
+                action = "download.ambiguous",          // 事件名
+                name = %name,                           // 请求名
+                candidates = ?list,                     // 候选列表
+                "匹配到多个文件"                         // 正文
+            );                                          // 宏结束
+            (                                           // 元组响应
+                StatusCode::CONFLICT,                   // 409
+                Json(json!({                            // 错误体
+                    "ok": false,                        // 业务失败
+                    "error": "匹配到多个文件，请使用完整文件名重试", // 提示
+                    "candidates": list,                 // 候选全名，供客户端重试
+                })),                                    // Json 结束
+            )                                           // 元组结束
+                .into_response()                        // 转 Response
+        }                                               // 分支结束
+    }                                                   // match 结束
+}                                                       // download_file 结束
+
+/// POST /api/download/check —— 查询文件是否存在，不返回文件内容。
+/// 复用 download::find_candidates，type 只是额外的扩展名过滤。
+pub async fn check_download(                             // check handler
+    State(state): State<AppState>,                      // 注入共享状态
+    Json(req): Json<CheckRequest>,                      // 注入请求体
+) -> Response {                                          // 返回统一 Response
+    let Some(dl) = state.config.download.as_ref().filter(|d| d.enabled) else { // 未启用兜底
+        return not_found("下载接口未启用");              // 404
+    };                                                  // let-else 结束
+
+    if let Err(e) = download::validate_requested_name(&req.name) { // 复用文件名校验
+        return bad_request(&format!("name 非法: {e}")); // 400
+    }                                                   // if 结束
+
+    // type 必须是配置白名单的子集，避免绕过 extensions 限制。
+    if let Some(t) = &req.file_type {                    // 请求带了 type
+        let t_lower = t.trim().to_ascii_lowercase();    // 去空白并统一小写
+        let allowed = dl.extensions.iter().any(|e| e.eq_ignore_ascii_case(&t_lower)); // 查白名单
+        if !allowed {                                   // 不在白名单
+            return bad_request(&format!("type 不在允许列表中: {t}")); // 400
+        }                                               // if 结束
+    }                                                   // if let 结束
+
+    let type_filter = req.file_type.as_deref()          // 比较用的小写类型
+        .map(|t| t.trim().to_ascii_lowercase());        // Option<&str> -> Option<String>
+    let candidates = match download::find_candidates(dl, &req.name, type_filter.as_deref()) { // 复用候选收集
+        Ok(v) => v,                                     // 成功
+        Err(e) => return server_error(&e),              // 目录不可读转 500
+    };                                                  // match 结束
+
+    let mut files: Vec<String> = candidates.iter()      // 只要文件名，不要路径
+        .filter_map(|p| p.file_name().and_then(|s| s.to_str()).map(|s| s.to_string())) // 转文件名
+        .collect();                                     // 收集
+    files.sort();                                       // 稳定顺序
+    files.dedup();                                      // 按文件名去重；不同 root 同名只算一个
+    let count = files.len();                            // 命中数量
+    let exist = count > 0;                              // 是否存在
+
+    tracing::info!(                                     // 业务日志
+        action = "download.check",                      // 事件名
+        name = %req.name,                               // 请求名
+        file_type = ?req.file_type,                     // 请求类型
+        count = count,                                  // 命中数量
+        "下载检查完成"                                   // 正文
+    );                                                  // 宏结束
+
+    Json(json!({                                        // 固定三字段响应
+        "exist": exist,                                 // 是否存在
+        "count": count,                                 // 命中数量
+        "files": files,                                 // 文件名数组，永远是数组
+    })).into_response()                                 // 200 + JSON
+}                                                       // check_download 结束
+
+/// 按扩展名给一个尽量准确的 Content-Type。
+fn mime_for(path: &Path) -> &'static str {              // 输入文件路径
+    match path.extension()                              // 取扩展名
+        .and_then(|s| s.to_str())                       // 转 &str
+        .unwrap_or("")                                  // 没有则空串
+        .to_ascii_lowercase()                           // 统一小写
+        .as_str()                                       // 借用比较
+    {                                                   // match 开始
+        "txt" => "text/plain; charset=utf-8",           // 纯文本
+        "csv" => "text/csv; charset=utf-8",             // CSV
+        "xls" => "application/vnd.ms-excel",            // 老 Excel
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", // 新 Excel
+        _ => "application/octet-stream",                // 默认二进制
+    }                                                   // match 结束
+}                                                       // mime_for 结束
+
+/// 按 RFC 5987 生成 Content-Disposition，中文名不乱码。
+fn content_disposition(file_name: &str) -> String {     // 输入文件名
+    let ascii: String = file_name.chars()               // 逐字符处理
+        .map(|c| if c.is_ascii() && c != '"' && c != '\\' { c } else { '_' }) // 非 ASCII 和引号换成下划线
+        .collect();                                     // 收集成安全 ASCII 名
+    format!(                                            // 两个 filename 参数并存
+        "attachment; filename=\"{ascii}\"; filename*=UTF-8''{}", // 兼容旧客户端 + 新标准
+        percent_encode(file_name)                       // 原名做百分号编码
+    )                                                   // format 结束
+}                                                       // content_disposition 结束
+
+/// 最小百分号编码，只保留 RFC 3986 未保留字符。
+fn percent_encode(s: &str) -> String {                  // 输入任意字符串
+    let mut out = String::new();                        // 结果缓冲
+    for b in s.as_bytes() {                             // 按字节处理，UTF-8 自然覆盖
+        match b {                                       // 分支
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(*b as char), // 未保留字符原样
+            _ => out.push_str(&format!("%{b:02X}")),    // 其余转义成 %XX
+        }                                               // match 结束
+    }                                                   // for 结束
+    out                                                 // 返回编码结果
+}                                                       // percent_encode 结束
+
+fn not_found(msg: &str) -> Response {                   // 统一 404 JSON 错误
+    (                                                   // 元组：(状态码, Json)
+        StatusCode::NOT_FOUND,                          // 404 Not Found
+        Json(json!({ "ok": false, "error": msg })),     // 错误体
+    )                                                   // 元组结束
+        .into_response()                                // 转成 Response
+}                                                       // not_found 结束
+
 fn bad_request(msg: &str) -> Response {                 // 统一 400 JSON 错误
     (                                                   // 元组：(状态码, Json)
         StatusCode::BAD_REQUEST,                        // 400 Bad Request
@@ -630,11 +1128,12 @@ fn server_error(msg: &str) -> Response {                // 统一 500 JSON 错�
 }                                                       // server_error 结束
 ```
 
-### 5.5 `src/main.rs` —— 入口、路由、CORS 与 JSON 日志
+### 5.6 `src/main.rs` —— 入口、路由、CORS 与 JSON 日志
 
 ```rust
 // Rust 不会自动发现源文件，模块必须显式声明。
 mod config;   // 配置加载与校验
+mod download; // 文件名校验与候选收集
 mod handler;  // HTTP handler
 mod parser;   // 文档解析与最小改动写入
 mod state;    // 共享状态与读写锁
@@ -708,12 +1207,26 @@ async fn main() -> anyhow::Result<()> {              // 程序入口；错误由
 
     let cors = build_cors(&config)?;                // 在 config 被移动前构造 CORS layer
     let target = config.config_file_path();         // 先记下目标文档路径用于日志
+    let download_enabled = config                   // 在 config 被移入 Arc 前取出下载开关
+        .download                                   // Option<DownloadConfig>
+        .as_ref()                                   // 借用
+        .is_some_and(|d| d.enabled);                // 只有配置且启用才为 true
     let state = state::AppState::new(config);       // config 被移入 Arc，之后不能再直接用
 
     let app = Router::new()                         // 构造路由器
         .route("/api/config", get(handler::read_config)) // GET：读取文档
         .route("/api/config/update", post(handler::update_one)) // POST：单字段更新
-        .route("/api/config/batch-update", post(handler::batch_update)) // POST：批量更新
+        .route("/api/config/batch-update", post(handler::batch_update)); // POST：批量更新
+
+    let app = if download_enabled {                 // 按开关决定是否注册下载相关路由
+        app                                         // 接住基础路由
+            .route("/download/{name}", get(handler::download_file)) // 单段文件名
+            .route("/api/download/check", post(handler::check_download)) // 存在性查询
+    } else {                                        // 未启用
+        app                                         // 保持原路由
+    };                                              // if 结束
+
+    let app = app                                   // 接上注入与中间件
         .with_state(state)                          // 注入共享状态
         .layer(cors)                                // 挂 CORS；OPTIONS 预检由它自动应答
         .layer(TraceLayer::new_for_http());         // 挂请求日志；配合 tower_http=debug
@@ -730,7 +1243,7 @@ async fn main() -> anyhow::Result<()> {              // 程序入口；错误由
 }                                                   // main 结束
 ```
 
-### 5.6 `Cargo.toml` 的 release 优化段
+### 5.7 `Cargo.toml` 的 release 优化段
 
 在 `[dependencies]` 之后追加：
 
@@ -744,12 +1257,12 @@ panic = "abort"     # panic 直接终止，不做栈展开
 
 排障期建议先注释掉 `panic = "abort"`，否则 panic 信息会变少。
 
-### 5.7 日志规范
+### 5.8 日志规范
 
 **访问日志**和**审计日志**分开：
 
 - 访问日志：每次 HTTP 请求一条，来自 `TraceLayer`，字段含 `method` / `uri` / `status` / `latency` 等。
-- 业务日志：来自 `tracing::info!(action = "config.updated", ...)`，记录改了哪些字段。
+- 业务日志：来自 `tracing::info!(action = "config.updated", ...)`，记录改了哪些字段；下载侧对应 `download.ok`、`download.miss`、`download.ambiguous` 三个事件，其中 ambiguous 用 `warn` 级别，方便统计误请求。
 - 审计日志：如果将来要追责，另行写 `audit.jsonl`，记录旧值 / 新值 / 操作来源；默认访问日志不记录 `value`，避免敏感内容进日志。
 
 典型 JSON 行：
@@ -818,6 +1331,57 @@ PowerShell 调用：
 ```powershell
 Invoke-RestMethod -Uri http://127.0.0.1:8080/api/config/update -Method Post `
   -ContentType 'application/json' -Body '{"name":"DataName","value":"TT26071311A002"}'
+```
+
+**下载文件**
+
+先放一个测试文件到 `data/downloads/20231123_164957_AS9283331.xlsx`，然后：
+
+```bash
+# 1) 末段 + 扩展名（推荐）
+curl -OJ http://127.0.0.1:8080/download/AS9283331.xlsx
+
+# 2) 只给 ID，由 extensions 白名单限定候选
+curl -OJ http://127.0.0.1:8080/download/AS9283331
+
+# 3) 完整文件名
+curl -OJ http://127.0.0.1:8080/download/20231123_164957_AS9283331.xlsx
+```
+
+唯一命中时返回 200、文件字节流和 `Content-Disposition: attachment`，`-OJ` 让 curl 按响应头里的文件名保存。如果同目录下再放一个 `20231123_164957_AS9283331.csv`，只给 ID 的请求就会变成 409：
+
+```bash
+curl -i http://127.0.0.1:8080/download/AS9283331
+```
+
+```json
+{"ok":false,"error":"匹配到多个文件，请使用完整文件名重试","candidates":["20231123_164957_AS9283331.csv","20231123_164957_AS9283331.xlsx"]}
+```
+
+PowerShell 保存到指定路径：
+
+```powershell
+Invoke-WebRequest -Uri http://127.0.0.1:8080/download/AS9283331.xlsx -OutFile AS9283331.xlsx
+```
+
+**查询是否存在（不下载）**
+
+```bash
+# 带类型
+curl -X POST http://127.0.0.1:8080/api/download/check \
+  -H "Content-Type: application/json" \
+  -d '{"name":"A12331","type":"xls"}'
+
+# 不带类型
+curl -X POST http://127.0.0.1:8080/api/download/check \
+  -H "Content-Type: application/json" \
+  -d '{"name":"A12331"}'
+```
+
+响应始终是 `exist` / `count` / `files` 三个字段，`exist: false` 时也是 200：
+
+```json
+{"exist":true,"count":2,"files":["20231209_120312_A12331.xls","20231209_120312_A12331.xlsx"]}
 ```
 
 启动后终端应持续输出 JSON Lines；如果没有每次请求日志，检查 `RUST_LOG` 是否包含 `tower_http=debug`。
@@ -1044,9 +1608,17 @@ git push origin v1.0.0     # 触发 CI，四个目标并行构建并发布
 | 浏览器报 `CORS policy: No 'Access-Control-Allow-Origin' header` | 前端来源没写进 `config.toml` 的 `[cors].allowed_origins`，或该数组为空 |
 | 预检 `OPTIONS` 返回 403 / 405 | 没挂 `CorsLayer`，或 `allowed_origins` 配错；确认使用的是 5.5 的路由代码 |
 | 带 `Authorization` 的跨域请求被拦 | `allow_headers` 没包含 `AUTHORIZATION`，或 `allow_credentials=true` 时来源写了 `"*"` |
-| 局域网访问不到 | `host` 改成 `0.0.0.0` 并放行防火墙；同时务必先加鉴权 |
+| 局域网访问不到 | `host` 改成具体内网 IP 或 `0.0.0.0`，放行防火墙；改完从外网验证一次端口不可达 |
 | 拷到别的电脑无法运行 | MSVC 动态版缺 VC++ 运行库；改用静态 CRT / musl 版，或安装 VC++ Redistributable |
 | 杀毒软件报警 | 未签名 exe 易被误报，企业内部分发建议做代码签名 |
+| 下载接口返回 404 | 先确认 `[download].enabled = true`；再检查 `roots` 是否存在、扩展名是否在 `extensions` 里、请求名是否和末段一致 |
+| 下载返回 409 而不是文件 | 目录里有多个候选；按 `candidates` 里的完整文件名重新请求，不要依赖服务端挑一个 |
+| 请求 `AS9283331.xlsx` 命中了 `.csv` | 不会：请求带扩展名时只做带扩展名的精确比较；确认用的是 5.4 的 `find_candidates` |
+| 下载中文文件名乱码 | 确认响应带 `filename*=UTF-8''...`；老客户端只能读 `filename=` 的 ASCII 兜底名 |
+| 下载大文件超时 | 检查 `max_file_size` 是否把文件跳过了（日志里有 warn）；流式返回已避免整文件入内存 |
+| 下载路径报越界或读到目录外文件 | 保持 `follow_symlinks = false`、`allow_subdirs = false`；不要手工改 `canonicalize` 前缀检查 |
+| check 接口返回 400 | `name` 含非法字符，或 `type` 不在 `extensions` 白名单里 |
+| check 返回 200 但 `exist=false` | 查询成功但没命中；核对 `name` 是否等于末段或完整文件名，以及是否漏了扩展名 |
 | `cargo run` 改代码没生效 | 用 `cargo watch -x run` 获得类似 uvicorn `--reload` 的体验 |
 
 ---
@@ -1055,8 +1627,15 @@ git push origin v1.0.0     # 触发 CI，四个目标并行构建并发布
 
 ### 上线前必备
 
-- **访问控制**：不要把无鉴权接口直接绑到 `0.0.0.0`。至少加 Bearer token，或限制来源 IP / 放在内网反向代理后面。
-- **CORS 收口**：`[cors].allowed_origins` 只写真正需要的来源；不要用 `"*"` 代替鉴权，也不要在 `allow_credentials=true` 时配通配符。
+- **网络边界（本方案不做代码鉴权）**：`host` 优先写具体内网 IP，不要直接用 `0.0.0.0`；必须全网卡监听时用防火墙只放行内网网段。上线前从外网或另一网段实际访问一次，确认端口不可达。下载接口会把文件交出去，check 接口会暴露文件是否存在，二者都依赖这层网络隔离。Windows 防火墙示例（管理员 PowerShell，网段和端口按实际改）：
+
+  ```powershell
+  New-NetFirewallRule -DisplayName "config-api-18981" `
+    -Direction Inbound -Protocol TCP -LocalPort 18981 `
+    -RemoteAddress 192.168.1.0/24 -Action Allow
+  ```
+- **下载目录收口**：`roots` 只写确实要公开的目录，不要写整个磁盘根目录或用户目录。`extensions` 保持明确白名单，`follow_symlinks` 和 `allow_subdirs` 默认保持 `false`；`max_file_size` 设为业务实际需要的量级。
+- **CORS 收口**：`[cors].allowed_origins` 只写真正需要的来源；CORS 不是访问控制，别用 `"*"` 当安全边界，也不要在 `allow_credentials=true` 时配通配符。
 - **JSON 日志落盘**：用环境变量或启动脚本把 stdout 重定向到日志文件，例如 `RUST_LOG=info,tower_http=debug .\config-api.exe >> logs\config-api.jsonl 2>&1`。
 - **时间同步**：JSON 日志和审计依赖时间字段，目标机应开 NTP。
 
@@ -1064,5 +1643,8 @@ git push origin v1.0.0     # 触发 CI，四个目标并行构建并发布
 
 - **审计日志**：单独写 `audit.jsonl`，一行一条 JSON，字段含时间、来源 IP、字段名、旧值、新值、结果。
 - **dry_run 预检**：批量接口加 `"dry_run": true`，只校验不落盘。
+- **Range 请求**：当前下载固定返回整文件（配合 `attachment` 强制下载，不做内联预览），因此没有实现 `206 Partial Content`。若要支持浏览器断点续传或 PDF 内联预览，再加单段 Range 解析与 `Accept-Ranges` 头。
+- **目录索引缓存**：现在每次下载请求都会扫描 `roots`。目录文件数上千时，可在启动时建索引，并用定时刷新或文件变更事件更新；注意刷新同样要做符号链接与越界检查。
+- **Swagger UI**：axum 不自带 Swagger；如需交互式接口文档，可用 `utoipa` + `utoipa-swagger-ui` 增加 `/swagger-ui` 和 `/api-docs/openapi.json`，做法见手把手教程的阶段 12.5。
 - **schema 版本**：在文档头部加 `# schema=v1`，解析时校验版本，避免文档格式悄悄变化。
 - **数据库化**：当数据从 txt 迁到 SQLite / MySQL 时再引入 `sea-orm` + `sea-orm-migration`；当前只读写 txt，引入 ORM 只会增加编译时间与复杂度。
