@@ -43,13 +43,13 @@ curl http://127.0.0.1:18981/api/config
 
 ## 4. 最容易踩的坑：VC++ 运行库
 
-本机工具链是 `x86_64-pc-windows-msvc`，默认**动态链接 CRT**。目标机如果是裸机，双击可能报缺 `VCRUNTIME140.dll` 或 `api-ms-win-crt-*.dll`。二选一：
+本机工具链是 `x86_64-pc-windows-msvc`，默认**动态链接 CRT**。目标机如果是裸机，双击可能报缺 `VCRUNTIME140.dll`（动态 CRT）或 UCRT 相关 DLL。二选一：
 
 **方案 A：目标机装运行库**
 
 装 Visual C++ 2015-2022 Redistributable (x64)。
 
-**方案 B：编译成静态 CRT（拷过去就能跑）**
+**方案 B：编译成静态 CRT（拷过去就能跑；CI 已采用）**
 
 ```powershell
 $env:RUSTFLAGS = "-C target-feature=+crt-static"
@@ -57,6 +57,8 @@ cargo build --release --target x86_64-pc-windows-msvc
 ```
 
 取 `target\x86_64-pc-windows-msvc\release\config-api.exe` 分发。
+
+> GitHub Actions 的 Release 包已经按方案 B 构建（见 `.github/workflows/build.yml`，`windows-2022` + `RUSTFLAGS=-C target-feature=+crt-static`）。**直接下载 Release 的 zip 不用再做这一步**；上面命令只针对本地 `cargo build --release` 后想自己分发的情况。CI 产物面向 Windows 10/11 x64，更早的系统请在目标机上先实测。
 
 > 未签名的 exe 可能被杀毒软件误报，企业内部分发建议做代码签名。
 

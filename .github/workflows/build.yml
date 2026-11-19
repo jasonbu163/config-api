@@ -17,6 +17,8 @@ jobs:
       matrix:
         include:
           # Windows 10/11 x64：静态 CRT，无需安装 VC++ 运行库
+          # 关键：MSVC 默认动态链接 CRT；下面的 rustflags 必须保留，
+          # 否则分发到裸机可能缺 VCRUNTIME140.dll / UCRT 相关 DLL。
           - os: windows-2022
             target: x86_64-pc-windows-msvc
             artifact: config-api-windows-x64
