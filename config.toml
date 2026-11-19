@@ -13,3 +13,18 @@ backup = true        # 修改前生成 .bak 备份
 
 [allowed_fields]
 fields = ["Thickness", "Temper", "Alloy", "Entry Width", "Exit Width", "DataName"]
+
+[cors]
+# 内网工具默认不留跨域来源；需要浏览器跨域时再填具体 Origin。
+allowed_origins = []
+allow_credentials = false
+
+[download]
+enabled = true
+roots = ["./data/downloads"]                # 相对路径基于本 config.toml 解析
+separator = "_"
+extensions = ["txt", "csv", "xls", "xlsx"]
+case_insensitive = true
+max_file_size = 104857600                   # 100 MiB
+allow_subdirs = false
+follow_symlinks = false

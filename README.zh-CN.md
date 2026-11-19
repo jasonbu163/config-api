@@ -2,234 +2,366 @@
 
 [English](README.md) | **简体中文**
 
-一个用 HTTP 接口改写纯文本配置文件的小服务。文件里每个字段是「`@字段名` + 下一行的值」的成对格式，服务按请求替换这些值，并用字段白名单兜底。
-
-技术栈：[axum](https://github.com/tokio-rs/axum) + [tokio](https://tokio.rs)。
+一个跑在内网的小 HTTP 服务，做两件事：**按请求改写纯文本配置文件里的字段值**，以及**按文件名从指定目录下载文件**。不需要数据库，目标机器不用装 Python / JVM / Rust。
 
 ![rust](https://img.shields.io/badge/rust-1.85%2B-orange)
 ![axum](https://img.shields.io/badge/axum-0.8-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
-> **当前状态**：仅为初始骨架。`src/main.rs` 还是 `cargo new` 生成的占位内容，下面的接口描述的是目标行为。
+> 功能已完整实现，可直接部署使用。想按阶段学习代码是怎么一步步写出来的，见文末「文档索引」。
 
-## 功能
+## 功能一览
 
-- 把整个配置文件读成结构化字段：`GET /api/config`
+- 读取配置：`GET /api/config`
 - 修改单个字段：`POST /api/config/update`
 - 批量修改，全成功或全不改：`POST /api/config/batch-update`
-- 白名单校验——只有 `config.toml` 里列出的字段允许写
-- 写入前可选生成 `.bak` 备份
-- 异步写锁保证同一时刻只有一个请求在改文件，不会写出半截内容
-- 启动期校验：配置写错立刻失败，而不是运行到一半才报错
+- 字段白名单：只有 `config.toml` 里列出的字段能改
+- 写入前自动生成 `.bak` 备份；写临时文件再原子替换，不会留下半截文件
+- 下载文件：`GET /download/{name}`，只给编号也能找到带时间戳前缀的文件
+- 先查再下：`POST /api/download/check`，返回是否存在、数量和文件名列表
+- 下载目录、允许的文件类型、大小上限都在 `config.toml` 里配
+- 启动期校验：配置写错立刻退出，不会带病运行
 
-## 环境要求
+## 工作原理
 
-- Rust 1.85+（`edition = "2024"`）
-- Windows：安装 **Visual Studio Build Tools**，勾选「使用 C++ 的桌面开发」工作负载（提供 `link.exe`，MSVC 工具链的硬依赖）
-- Linux：`build-essential`
-- macOS：`xcode-select --install`
+```mermaid
+flowchart TD
+    A[客户端请求] --> B{路由判断}
+
+    B -->|/api/config| C[读取字段]
+    B -->|/api/config/update| D[更新字段]
+    B -->|/api/config/batch-update| D
+    B -->|/download/name| E[下载文件]
+    B -->|/api/download/check| F[查询是否存在]
+
+    C --> G[读写锁]
+    D --> G
+    G --> H[白名单校验 → 保真改写 → .bak 备份 → 原子替换]
+    H --> I[(目标 txt)]
+
+    K[(downloads 目录)] --> J[扫描候选文件]
+    E --> J
+    F --> J
+    J --> L[两级精确匹配<br/>全名 → 末段]
+    L --> M{候选数}
+    M -->|0| N[404]
+    M -->|1| O[文件流下载]
+    M -->|多个| P[409 + 候选列表]
+
+    S[(config.toml)] -.-> G
+    S -.-> J
+```
+
+两条主线：配置改写经过读写锁、白名单和原子替换；下载走目录扫描和两级精确匹配。`config.toml` 同时决定能改哪些字段、从哪些目录下载、允许哪些类型。
+
+## 你会拿到什么
+
+部署包只需要这几样：
+
+```text
+config-api/
+├── config-api.exe      # Linux / macOS 为 config-api，无 .exe 后缀
+├── config.toml         # 所有行为都在这里配
+├── data/
+│   ├── SmartViewConfig.txt   # 被改写的目标文件（换成你的真实文件）
+│   └── downloads/            # 可被下载的文件放这里（示例文件可删）
+└── README.md
+```
+
+目标机器**不需要任何运行环境**。把目录整体拷过去，改完 `config.toml` 就能跑。
 
 ## 快速开始
 
-```bash
-# 1. 先改 config.toml，让 files.base_dir 指向一个已存在的目录
-# 2. 启动
-cargo run
+### 1. 改配置
 
-# 3. 默认监听 http://127.0.0.1:8080
-curl http://127.0.0.1:8080/api/config
+打开 `config.toml`，至少确认三处：
+
+- `[server].host`：只在本机用就保持 `127.0.0.1`；局域网其他机器要访问，写本机内网 IP（如 `192.168.1.10`）
+- `[files].base_dir` 和 `file_name`：指向要改写的那个 txt
+- `[download].roots`：指向允许下载的目录
+
+> **Windows 路径里的反斜杠要写两遍**：`C:\\SmartView\\config`。写单反斜杠会解析失败。
+
+### 2. 启动
+
+Windows：双击 `config-api.exe`，或在 PowerShell 里运行：
+
+```powershell
+.\config-api.exe
 ```
 
-配置文件路径可以用第一个命令行参数覆盖：
+开发机上也可以直接 `cargo run`。服务默认监听 `http://127.0.0.1:18981`。
 
-```bash
-cargo run -- /path/to/other-config.toml
+想用另一份配置文件（比如测试用）：
+
+```powershell
+.\config-api.exe D:\config-api\config-test.toml
 ```
 
-## 配置说明
+### 3. 验证
 
-`config.toml` 放在项目根目录（与 `Cargo.toml` 同级）。**Windows 路径中的反斜杠必须双写**，因为 TOML 字符串里 `\` 是转义符。
+```bash
+curl http://127.0.0.1:18981/api/config
+```
+
+看到 `{"ok":true,"file":"...","fields":[...]}` 就说明起来了。
+
+### 4. 停止
+
+在运行窗口按 `Ctrl+C`；双击启动的窗口直接关掉即可。
+
+## 配置文件详解
+
+`config.toml` 和程序放在同一个目录。**相对路径都基于 `config.toml` 所在目录解析**，不是基于你双击程序时的工作目录。拼错任何键名都会启动失败。
 
 ```toml
 [server]
-host = "127.0.0.1"                   # 局域网访问改成 "0.0.0.0"
-port = 8080
+host = "127.0.0.1"
+port = 18981
 
 [files]
-base_dir = "C:\\SmartView\\config"   # 目标文件所在目录
+base_dir = "./data"
 file_name = "SmartViewConfig.txt"
-backup = true                        # 修改前生成 .bak 备份
+backup = true
 
 [allowed_fields]
 fields = ["Thickness", "Temper", "Alloy", "Entry Width", "Exit Width", "DataName"]
+
+[cors]
+allowed_origins = []
+allow_credentials = false
+
+[download]
+enabled = true
+roots = ["./data/downloads"]
+separator = "_"
+extensions = ["txt", "csv", "xls", "xlsx"]
+case_insensitive = true
+max_file_size = 104857600
+allow_subdirs = false
+follow_symlinks = false
 ```
 
-| 配置项 | 类型 | 说明 |
-|---|---|---|
-| `server.host` | 字符串 | 监听地址，必须能解析为 IP 字面量 |
-| `server.port` | 整数 | 不能为 `0` |
-| `files.base_dir` | 字符串 | 启动时必须存在且是目录 |
-| `files.file_name` | 字符串 | 非空文件名，与 `base_dir` 拼接 |
-| `files.backup` | 布尔 | 可省略，缺省为 `false` |
-| `allowed_fields.fields` | 字符串数组 | 非空，可写字段白名单 |
+### 服务与文件
 
-未知配置项会直接报错（`deny_unknown_fields`），拼错的键不会被静默忽略——这是给运维排错留的余地。
+| 配置项 | 说明 |
+|---|---|
+| `server.host` | 监听 IP。必须写 IP，不能写域名。局域网访问写具体内网 IP |
+| `server.port` | 端口，不能为 `0`。默认 `18981` |
+| `files.base_dir` | 目标文件所在目录，启动时会检查存在 |
+| `files.file_name` | 只写文件名，不能写路径 |
+| `files.backup` | `true` 时每次改写前生成同目录 `.bak` |
+
+### 可改字段白名单
+
+`allowed_fields.fields` 列出允许通过接口修改的字段名。不在列表里的字段一律 400 拒绝。写接口只改 `@字段` 下面那一行的值，注释、空行、行尾风格原样保留。
+
+### 下载设置
+
+| 配置项 | 说明 |
+|---|---|
+| `download.enabled` | `false` 时不注册下载和查询接口 |
+| `download.roots` | 允许下载的目录，可写多个；只从这些目录里找文件 |
+| `separator` | 文件名切分符，默认 `_` |
+| `extensions` | 允许的文件类型，小写、不带点。不在这个列表里的文件既不会被匹配也不会被下载 |
+| `case_insensitive` | `true` 时忽略大小写，避免 Windows / Linux 行为不一致 |
+| `max_file_size` | 单文件字节上限，超过就跳过；`0` 表示不限 |
+| `allow_subdirs` | `false` 只扫目录顶层，`true` 递归子目录 |
+| `follow_symlinks` | 保持 `false`，避免通过链接读到目录外的文件 |
+
+### 浏览器跨域（一般不用改）
+
+`[cors].allowed_origins` 留空数组表示只允许同源。有前端页面要跨域调用时，把页面地址写进去，例如 `["http://localhost:5173"]`。CORS 不是鉴权，别拿它当安全边界。
 
 ## 目标文件格式
 
-被修改的 txt 采用「`@字段名` 换行 + 值」的成对格式：
+被改写的 txt 是「`@字段名` 一行 + 值一行」：
 
-```
+```text
+# 设备配置，请勿手改
 @DataName
 TT26071311A002
+
 @Thickness
 25
 @Temper
 T3
 ```
 
-解析规则：以 `@` 开头的行是字段名，紧随其后的下一行是值，空行跳过，CRLF 行尾兼容。输出统一重排为 `\n` 结尾。
+- 以 `@` 开头的行是字段名，紧跟着的下一行是值
+- 注释、空行、行尾（CRLF / LF）原样保留，只替换值那一行
+- 同一个字段出现两次会拒绝修改，避免改错
+- 值不能含换行，也不能以 `@` 开头
+- 文件请保存为 UTF-8；GBK 文件会乱码
+
+## 下载文件怎么用
+
+目录里有这样一个文件：
+
+```text
+data/downloads/20231123_164957_AS9283331.xlsx
+```
+
+下面三种请求都能取到它：
+
+```bash
+# 只给编号和类型（推荐）
+curl -OJ http://127.0.0.1:18981/download/AS9283331.xlsx
+
+# 只给编号，类型由配置里的 extensions 决定
+curl -OJ http://127.0.0.1:18981/download/AS9283331
+
+# 给完整文件名
+curl -OJ http://127.0.0.1:18981/download/20231123_164957_AS9283331.xlsx
+```
+
+匹配规则只有两级，都是**精确比较**，没有模糊搜索：
+
+1. 请求名等于完整文件名
+2. 请求名等于按 `separator` 切出来的最后一段；只给编号时也允许和“末段去扩展名”比较
+
+结果判定固定为：0 个候选返回 404；1 个返回文件；**多个一律返回 409 并列出候选全名，不会偷偷挑一个**。比如同目录下还有 `..._AS9283331.csv`，只给 `AS9283331` 就会返回 409，这时用完整文件名再请求一次即可。
+
+下载响应带 `Content-Disposition: attachment`，浏览器会当作附件保存，中文文件名不会乱码。
 
 ## HTTP 接口
 
-所有响应均为 JSON。
+所有 JSON 接口的端口都是 `18981`（除非你改了配置）。
 
-### `GET /api/config`
-
-返回文件当前的解析结果。
-
-```json
-{
-  "ok": true,
-  "file": "C:\\SmartView\\config\\SmartViewConfig.txt",
-  "fields": [
-    { "name": "DataName", "value": "TT26071311A002" },
-    { "name": "Thickness", "value": "25" }
-  ]
-}
-```
-
-### `POST /api/config/update`
-
-修改单个字段。
+### 读取配置字段
 
 ```bash
-curl -X POST http://127.0.0.1:8080/api/config/update \
-  -H "Content-Type: application/json" \
-  -d '{"name":"DataName","value":"TT26071311A002"}'
+curl http://127.0.0.1:18981/api/config
 ```
 
 ```json
-{
-  "ok": true,
-  "file": "C:\\SmartView\\config\\SmartViewConfig.txt",
-  "applied": ["DataName"],
-  "count": 1
-}
+{"ok":true,"file":"./data/SmartViewConfig.txt","fields":[{"name":"Thickness","value":"25"}]}
 ```
 
-### `POST /api/config/batch-update`
-
-一次写入多个字段。任一项校验失败或字段在文件中不存在，**文件保持原样，不做任何修改**。
+### 改一个字段
 
 ```bash
-curl -X POST http://127.0.0.1:8080/api/config/batch-update \
+curl -X POST http://127.0.0.1:18981/api/config/update \
   -H "Content-Type: application/json" \
-  -d '{"items":[{"name":"DataName","value":"NEW001"},{"name":"Thickness","value":"25"}]}'
+  -d '{"name":"Thickness","value":"25"}'
 ```
 
-PowerShell 写法：
+```json
+{"ok":true,"file":"./data/SmartViewConfig.txt","applied":["Thickness"],"count":1}
+```
+
+### 批量改
+
+任一项不合法或字段不存在，整个文件保持原样。
+
+```bash
+curl -X POST http://127.0.0.1:18981/api/config/batch-update \
+  -H "Content-Type: application/json" \
+  -d '{"items":[{"name":"Thickness","value":"25"},{"name":"Temper","value":"T3"}]}'
+```
+
+### 查文件在不在（不下载）
+
+```bash
+curl -X POST http://127.0.0.1:18981/api/download/check \
+  -H "Content-Type: application/json" \
+  -d '{"name":"A12331","type":"xls"}'
+```
+
+```json
+{"exist":true,"count":1,"files":["20231209_120312_A12331.xls"]}
+```
+
+`type` 可省略；省略时返回所有类型。`files` 永远是数组，`count` 永远是数字；没找到是 `{"exist":false,"count":0,"files":[]}`，状态码仍是 200。`type` 必须是 `extensions` 里配过的类型，否则 400。
+
+### PowerShell 写法
 
 ```powershell
-Invoke-RestMethod -Uri http://127.0.0.1:8080/api/config/update -Method Post `
-  -ContentType 'application/json' -Body '{"name":"DataName","value":"TT26071311A002"}'
+Invoke-RestMethod -Uri http://127.0.0.1:18981/api/config/update -Method Post `
+  -ContentType 'application/json' -Body '{"name":"Thickness","value":"25"}'
+
+Invoke-WebRequest -Uri http://127.0.0.1:18981/download/AS9283331.xlsx -OutFile AS9283331.xlsx
 ```
 
-### 错误响应
+### 错误码
 
-| 状态码 | 响应体 | 触发条件 |
-|---|---|---|
-| 400 | `{"ok":false,"error":"字段不在白名单中: X"}` | 字段不在 `allowed_fields` 里 |
-| 400 | `{"ok":false,"error":"items 不能为空"}` | `items` 是空数组 |
-| 400 | `{"ok":false,"error":"value 不能包含换行或以 @ 开头"}` | 值会破坏文件格式 |
-| 500 | `{"ok":false,"error":"..."}` | 读写文件失败，或字段在文件中不存在 |
+| 状态码 | 含义 |
+|---|---|
+| 400 | 参数不合法：字段不在白名单、值为空或含换行、`type` 不在允许列表 |
+| 404 | 下载没找到匹配文件 |
+| 409 | 下载匹配到多个文件，按返回的候选全名重试 |
+| 500 | 读写文件失败，或目录不可访问 |
 
-所有请求都要满足值约束：不能含 `\n`/`\r`，去掉前导空白后不能以 `@` 开头。
+## 打包与分发
 
-## 构建与分发
+### 打包
 
 ```bash
 cargo build --release
 ```
 
-产物：`target/release/config-api`（Windows 为 `target\release\config-api.exe`）。`cargo run` 产出的 debug 二进制不要分发。
+产物在 `target/release/config-api`（Windows 为 `target\release\config-api.exe`）。**不要用 `cargo run` 生成的 debug 版本分发**。
 
-分发内容就是 `config-api(.exe)` + `config.toml` 两份，目标机**不需要装任何运行环境**——不用 Rust、不用 Python、不用 JVM。
+把下面这些打成一个 zip 即可：
 
-跨平台编译的三条硬规则：
-
-- macOS 产物只能在 macOS 上编（苹果 SDK 许可限制），从 Windows/Linux 交叉编译不可行
-- Linux → Windows 可行（需装 `mingw-w64`）；macOS → Windows 基本不可行
-- Windows MSVC 产物依赖 VC++ 运行库；裸机场景改用 `x86_64-pc-windows-gnu`，或安装 VC++ Redistributable
-
-## 持续集成
-
-`.github/workflows/build.yml` 让四个目标并行构建。
-
-- 触发条件是推送 tag（`v*`）或手动点 *Run workflow*；**推 `main` 分支不会触发**
-- matrix：`windows-2022`（x86_64-pc-windows-msvc，静态 CRT）、`ubuntu-24.04`（x86_64-unknown-linux-musl）、`ubuntu-24.04-arm`（aarch64-unknown-linux-musl）、`macos-15`（aarch64-apple-darwin）
-- musl 产物完全静态，不依赖目标机的 glibc 版本，可直接在麒麟、统信、openEuler 上运行
-- 推送 tag 时，`release` job 会把四个平台的包打成 zip 并挂到 GitHub Release
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
+```text
+config-api-1.0.0-windows-x64/
+├── config-api.exe
+├── config.toml
+├── data/SmartViewConfig.txt
+├── data/downloads/
+└── README.md
 ```
 
-## 项目结构
+### 目标机器上的步骤
 
+1. 解压到任意目录（建议固定路径，方便写服务脚本）
+2. 按实际情况改 `config.toml`
+3. 把要改写的 txt 放到 `files.base_dir`，把要下载的文件放到 `download.roots`
+4. 双击 exe 或命令行启动
+5. 从另一台机器访问 `http://内网IP:18981/api/config` 验证
+
+### 局域网访问
+
+只在本机用：`host = "127.0.0.1"`，什么都不用改。
+
+局域网其他机器要用：把 `host` 改成**本机的内网 IP**（例如 `192.168.1.10`），并在 Windows 防火墙放行 `18981` 端口：
+
+```powershell
+New-NetFirewallRule -DisplayName "config-api-18981" `
+  -Direction Inbound -Protocol TCP -LocalPort 18981 `
+  -RemoteAddress 192.168.1.0/24 -Action Allow
 ```
-config-api/
-├── .github/workflows/build.yml   # 四目标发布流水线
-├── docs/                         # 完整实现与打包指南
-├── src/
-│   └── main.rs
-├── .gitignore
-├── Cargo.lock                    # 必须提交：这是应用而非库
-└── Cargo.toml
-```
 
-规划中的模块划分：
+按实际网段和端口改。**部署完从外网或另一网段访问一次，确认端口不可达**——本方案不做登录鉴权，安全边界就是网络隔离。
 
-| 文件 | 职责 |
-|---|---|
-| `src/config.rs` | 加载并校验 `config.toml` |
-| `src/state.rs` | 共享状态与异步写锁 |
-| `src/parser.rs` | `@字段` 格式的解析、渲染、改写 |
-| `src/handler.rs` | 三个接口的处理函数 |
-| `src/main.rs` | 初始化、路由、监听 |
+### 跨平台注意
+
+- macOS 版本只能在 macOS 上编译
+- Linux 静态版（musl）不依赖目标机器的 glibc，适合麒麟、统信、openEuler
+- Windows MSVC 版依赖 VC++ 运行库；裸机可用静态 CRT 版或安装 VC++ Redistributable
+- 未签名的 exe 可能被杀毒软件误报，企业内部分发建议做代码签名
 
 ## 常见问题
 
 | 现象 | 原因与解决 |
 |---|---|
-| 编译报 `link.exe not found` | 缺 VS Build Tools 的「使用 C++ 的桌面开发」工作负载 |
-| 首次编译卡住很久 | 正常，正在下载编译上百个 crate；之后增量编译是秒级 |
+| 启动就退出，提示 `base_dir` 不存在 | 路径写错，或 Windows 反斜杠没双写 |
+| 提示 `download.roots` 不存在 | 下载目录没建；按配置里的路径建好目录 |
 | `Address already in use` | 端口被占用，改 `server.port` 或结束旧进程 |
-| 启动即退出并提示 base_dir 不存在 | 路径写错，或 Windows 反斜杠没双写 |
-| 写文件报 `os error 32` | 文件被其他进程独占（记事本、同步盘），关掉再试 |
-| 中文内容乱码 | 目标 txt 是 GBK 而程序按 UTF-8 读写；另存为 UTF-8 或引入 `encoding_rs` 转码 |
-| 局域网访问不到 | `host` 改成 `0.0.0.0`，并在防火墙放行该端口 |
-| 杀毒软件报警 | 未签名 exe 易被误报，企业内部分发建议做代码签名 |
+| 局域网访问不到 | 检查 `host` 是否写成内网 IP、防火墙是否放行 |
+| 下载返回 404 | 检查类型是否在 `extensions` 里、文件名末段是否匹配 |
+| 下载返回 409 | 候选不唯一；用响应里列出的完整文件名重试 |
+| 写文件报 `os error 32` | 文件被记事本或同步盘占用，关掉占用程序 |
+| 中文乱码 | 目标文件是 GBK；另存为 UTF-8 |
+| 浏览器提示 CORS | 把前端页面地址写进 `[cors].allowed_origins` |
 
-## 延伸阅读
+## 文档索引
 
-完整的设计说明、打包矩阵与 CI 原理见 [`docs/Axum配置接口_完整实现与打包指南.md`](docs/Axum配置接口_完整实现与打包指南.md)。
-
-后续可扩展：Bearer token 鉴权、审计日志（`时间<TAB>字段<TAB>旧值<TAB>新值`）、批量接口的 `dry_run` 预检。
+- 本文：面向使用者的运行、配置、接口与打包说明
+- [`docs/Axum配置接口_完整实现与打包指南.md`](docs/Axum配置接口_完整实现与打包指南.md)：面向开发者，逐模块代码说明与打包矩阵
+- [`docs/Axum配置接口_手把手教程.md`](docs/Axum配置接口_手把手教程.md)：面向学习者，从 Hello World 一步步推导到最终版本
 
 ## 许可证
 
-本项目基于 [MIT 协议](LICENSE) 发布。
-
-Copyright (c) 2026 jasonbu163
+基于 [MIT 协议](LICENSE) 发布。Copyright (c) 2026 jasonbu163

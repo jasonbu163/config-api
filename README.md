@@ -2,236 +2,366 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A small HTTP service that patches values in a plain-text config file. Each field is stored as an `@FieldName` line followed by its value; the service rewrites those values on request, guarded by a field whitelist.
-
-Built with [axum](https://github.com/tokio-rs/axum) + [tokio](https://tokio.rs).
+A small HTTP service for an internal network. It does two things: **updates field values in a plain-text config file on request**, and **downloads files from a configured directory by name**. No database, and the target machine needs no Python / JVM / Rust.
 
 ![rust](https://img.shields.io/badge/rust-1.85%2B-orange)
 ![axum](https://img.shields.io/badge/axum-0.8-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
-> **Status**: early skeleton. `src/main.rs` is still the `cargo new` placeholder; the API documented below describes the intended behavior.
+> Fully implemented and ready to deploy. To learn how the code was built step by step, see the document index at the end.
 
 ## Features
 
-- Read the whole config file as structured fields: `GET /api/config`
-- Update a single field: `POST /api/config/update`
-- Update several fields atomically (all-or-nothing): `POST /api/config/batch-update`
-- Whitelist enforcement — only fields listed in `config.toml` can be written
-- Optional `.bak` backup before every write
-- Single-writer guarantee via an async write lock (no interleaved writes)
-- Startup validation: a broken config fails fast instead of surfacing at request time
+- Read config fields: `GET /api/config`
+- Update one field: `POST /api/config/update`
+- Batch update, all-or-nothing: `POST /api/config/batch-update`
+- Field whitelist — only fields listed in `config.toml` can be changed
+- Automatic `.bak` backup before every write; temp file plus atomic replace, so a partial file is never left behind
+- Download files: `GET /download/{name}` — an ID alone can find a file whose name has a timestamp prefix
+- Check before downloading: `POST /api/download/check` returns existence, count, and matching file names
+- Download directory, allowed file types, and size limits are all configured in `config.toml`
+- Startup validation: a broken config stops the service immediately instead of failing at request time
 
-## Requirements
+## How It Works
 
-- Rust 1.85+ (`edition = "2024"`)
-- On Windows: **Visual Studio Build Tools** with the *Desktop development with C++* workload (provides `link.exe`, mandatory for the MSVC toolchain)
-- On Linux: `build-essential`
-- On macOS: `xcode-select --install`
+```mermaid
+flowchart TD
+    A[Client request] --> B{Router}
+
+    B -->|/api/config| C[Read fields]
+    B -->|/api/config/update| D[Update fields]
+    B -->|/api/config/batch-update| D
+    B -->|/download/name| E[Download file]
+    B -->|/api/download/check| F[Check existence]
+
+    C --> G[Read/write lock]
+    D --> G
+    G --> H[Whitelist → in-place patch → .bak backup → atomic replace]
+    H --> I[(Target txt)]
+
+    K[(downloads dir)] --> J[Scan candidate files]
+    E --> J
+    F --> J
+    J --> L[Two-level exact match<br/>full name → last segment]
+    L --> M{Candidate count}
+    M -->|0| N[404]
+    M -->|1| O[File stream]
+    M -->|many| P[409 + candidate list]
+
+    S[(config.toml)] -.-> G
+    S -.-> J
+```
+
+Two paths: config edits go through the lock, whitelist, and atomic replace; downloads go through directory scanning and two-level exact matching. `config.toml` controls which fields may change, which directories are searched, and which file types are allowed.
+
+## What You Get
+
+A deployment folder needs only these items:
+
+```text
+config-api/
+├── config-api.exe      # config-api on Linux / macOS, no .exe suffix
+├── config.toml         # every setting lives here
+├── data/
+│   ├── SmartViewConfig.txt   # the file to be edited (replace with your real file)
+│   └── downloads/            # files that may be downloaded (sample files can be removed)
+└── README.md
+```
+
+The target machine needs **no runtime**. Copy the folder, edit `config.toml`, and run it.
 
 ## Quick Start
 
-```bash
-# 1. edit config.toml so that files.base_dir points at a directory that exists
-# 2. run
-cargo run
+### 1. Edit the config
 
-# 3. the service listens on http://127.0.0.1:8080 by default
-curl http://127.0.0.1:8080/api/config
+Open `config.toml` and check at least these three things:
+
+- `[server].host`: keep `127.0.0.1` for local-only use; for LAN access, use this machine's internal IP (e.g. `192.168.1.10`)
+- `[files].base_dir` and `file_name`: point at the txt file you want to edit
+- `[download].roots`: point at the directory that holds downloadable files
+
+> **On Windows, backslashes must be doubled**: `C:\\SmartView\\config`. A single backslash fails to parse.
+
+### 2. Start the service
+
+On Windows, double-click `config-api.exe`, or run it in PowerShell:
+
+```powershell
+.\config-api.exe
 ```
 
-A second CLI argument overrides the config path:
+On a development machine, `cargo run` works too. The service listens on `http://127.0.0.1:18981` by default.
 
-```bash
-cargo run -- /path/to/other-config.toml
+To use a different config file (e.g. for testing):
+
+```powershell
+.\config-api.exe D:\config-api\config-test.toml
 ```
 
-## Configuration
+### 3. Verify
 
-`config.toml` lives next to `Cargo.toml`. On Windows, backslashes **must be double-escaped** in TOML strings.
+```bash
+curl http://127.0.0.1:18981/api/config
+```
+
+If you see `{"ok":true,"file":"...","fields":[...]}`, it is running.
+
+### 4. Stop
+
+Press `Ctrl+C` in the running window, or just close the window if you double-clicked the exe.
+
+## Configuration Reference
+
+`config.toml` sits next to the executable. **Relative paths are resolved from the config file's directory**, not from the current working directory. A misspelled key stops startup.
 
 ```toml
 [server]
-host = "127.0.0.1"                   # use "0.0.0.0" to expose on the LAN
-port = 8080
+host = "127.0.0.1"
+port = 18981
 
 [files]
-base_dir = "C:\\SmartView\\config"   # directory holding the target file
+base_dir = "./data"
 file_name = "SmartViewConfig.txt"
-backup = true                        # write a .bak copy before modifying
+backup = true
 
 [allowed_fields]
 fields = ["Thickness", "Temper", "Alloy", "Entry Width", "Exit Width", "DataName"]
+
+[cors]
+allowed_origins = []
+allow_credentials = false
+
+[download]
+enabled = true
+roots = ["./data/downloads"]
+separator = "_"
+extensions = ["txt", "csv", "xls", "xlsx"]
+case_insensitive = true
+max_file_size = 104857600
+allow_subdirs = false
+follow_symlinks = false
 ```
 
-| Key | Type | Description |
-|---|---|---|
-| `server.host` | string | Listen address; must parse as an IP literal |
-| `server.port` | integer | Must not be `0` |
-| `files.base_dir` | string | Must exist and be a directory at startup |
-| `files.file_name` | string | Non-empty file name, joined onto `base_dir` |
-| `files.backup` | bool | Optional, defaults to `false` |
-| `allowed_fields.fields` | string[] | Non-empty whitelist of writable fields |
+### Server and target file
 
-Unknown keys are rejected (`deny_unknown_fields`), so typos fail at startup rather than being silently ignored.
+| Key | Meaning |
+|---|---|
+| `server.host` | Listen IP. Must be an IP literal, not a hostname |
+| `server.port` | Port, must not be `0`. Default `18981` |
+| `files.base_dir` | Directory of the target file; must exist at startup |
+| `files.file_name` | File name only — no path components |
+| `files.backup` | When `true`, write a `.bak` copy before each edit |
+
+### Field whitelist
+
+`allowed_fields.fields` lists the field names that may be changed through the API. Anything outside the list is rejected with 400. The write API replaces only the value line below each `@field`; comments, blank lines, and line endings are preserved as-is.
+
+### Download settings
+
+| Key | Meaning |
+|---|---|
+| `download.enabled` | When `false`, neither download nor check routes are registered |
+| `download.roots` | Directories to search; more than one is allowed |
+| `separator` | Name separator, `_` by default |
+| `extensions` | Allowed file types, lowercase without the dot. Files outside this list are neither matched nor downloaded |
+| `case_insensitive` | When `true`, comparisons ignore case — keeps Windows and Linux consistent |
+| `max_file_size` | Byte limit per file; over the limit is skipped. `0` means unlimited |
+| `allow_subdirs` | `false` scans only the top level; `true` recurses |
+| `follow_symlinks` | Keep `false` so a link cannot point outside the root |
+
+### Browser CORS (usually unchanged)
+
+`[cors].allowed_origins` empty means same-origin only. To let a front-end page call the API, add its address, e.g. `["http://localhost:5173"]`. CORS is not authentication — do not treat it as a security boundary.
 
 ## Target File Format
 
-The file being edited pairs an `@FieldName` line with the value on the next line:
+The txt file being edited stores a field name on one line and its value on the next:
 
-```
+```text
+# Do not edit by hand
 @DataName
 TT26071311A002
+
 @Thickness
 25
 @Temper
 T3
 ```
 
-Parsing rules: lines starting with `@` declare a field, the immediately following line is its value, and blank lines are skipped. CRLF endings are tolerated. Output is always re-rendered with `\n`.
+- A line starting with `@` declares a field; the next line is its value
+- Comments, blank lines, and line endings (CRLF / LF) are preserved; only the value line is replaced
+- A duplicate field is rejected rather than guessed
+- Values cannot contain newlines or start with `@`
+- Save the file as UTF-8; GBK files will show garbled text
+
+## Downloading Files
+
+Suppose the directory contains:
+
+```text
+data/downloads/20231123_164957_AS9283331.xlsx
+```
+
+All three requests below find it:
+
+```bash
+# ID plus type (recommended)
+curl -OJ http://127.0.0.1:18981/download/AS9283331.xlsx
+
+# ID only; the allowed types come from extensions in config.toml
+curl -OJ http://127.0.0.1:18981/download/AS9283331
+
+# Full file name
+curl -OJ http://127.0.0.1:18981/download/20231123_164957_AS9283331.xlsx
+```
+
+Matching uses two levels of **exact comparison** — no fuzzy search:
+
+1. The request equals the full file name
+2. The request equals the last segment after splitting on `separator`; with an ID-only request, the segment with its extension removed is also compared
+
+Results are fixed: 0 candidates → 404, 1 → the file, **more than one → 409 with the candidate names listed, never a silent guess**. For example, if `..._AS9283331.csv` also exists, `AS9283331` alone returns 409 — retry with the full name.
+
+The response carries `Content-Disposition: attachment`, so browsers save it as a file, and non-ASCII names are encoded correctly.
 
 ## HTTP API
 
-All responses are JSON.
+All JSON endpoints use port `18981` unless you changed it.
 
-### `GET /api/config`
-
-Returns the current parsed content of the file.
-
-```json
-{
-  "ok": true,
-  "file": "C:\\SmartView\\config\\SmartViewConfig.txt",
-  "fields": [
-    { "name": "DataName", "value": "TT26071311A002" },
-    { "name": "Thickness", "value": "25" }
-  ]
-}
-```
-
-### `POST /api/config/update`
-
-Update one field.
+### Read fields
 
 ```bash
-curl -X POST http://127.0.0.1:8080/api/config/update \
-  -H "Content-Type: application/json" \
-  -d '{"name":"DataName","value":"TT26071311A002"}'
+curl http://127.0.0.1:18981/api/config
 ```
 
 ```json
-{
-  "ok": true,
-  "file": "C:\\SmartView\\config\\SmartViewConfig.txt",
-  "applied": ["DataName"],
-  "count": 1
-}
+{"ok":true,"file":"./data/SmartViewConfig.txt","fields":[{"name":"Thickness","value":"25"}]}
 ```
 
-### `POST /api/config/batch-update`
-
-Update several fields in one write. If any item fails validation or references a missing field, **nothing** is written.
+### Update one field
 
 ```bash
-curl -X POST http://127.0.0.1:8080/api/config/batch-update \
+curl -X POST http://127.0.0.1:18981/api/config/update \
   -H "Content-Type: application/json" \
-  -d '{"items":[{"name":"DataName","value":"NEW001"},{"name":"Thickness","value":"25"}]}'
+  -d '{"name":"Thickness","value":"25"}'
 ```
 
-PowerShell:
+```json
+{"ok":true,"file":"./data/SmartViewConfig.txt","applied":["Thickness"],"count":1}
+```
+
+### Batch update
+
+If any item fails validation or names a missing field, **nothing is written**.
+
+```bash
+curl -X POST http://127.0.0.1:18981/api/config/batch-update \
+  -H "Content-Type: application/json" \
+  -d '{"items":[{"name":"Thickness","value":"25"},{"name":"Temper","value":"T3"}]}'
+```
+
+### Check whether a file exists (no download)
+
+```bash
+curl -X POST http://127.0.0.1:18981/api/download/check \
+  -H "Content-Type: application/json" \
+  -d '{"name":"A12331","type":"xls"}'
+```
+
+```json
+{"exist":true,"count":1,"files":["20231209_120312_A12331.xls"]}
+```
+
+`type` is optional; omit it to match any allowed type. `files` is always an array and `count` is always a number. No match returns `{"exist":false,"count":0,"files":[]}` with status 200. `type` must be one of the configured `extensions`, otherwise 400.
+
+### PowerShell examples
 
 ```powershell
-Invoke-RestMethod -Uri http://127.0.0.1:8080/api/config/update -Method Post `
-  -ContentType 'application/json' -Body '{"name":"DataName","value":"TT26071311A002"}'
+Invoke-RestMethod -Uri http://127.0.0.1:18981/api/config/update -Method Post `
+  -ContentType 'application/json' -Body '{"name":"Thickness","value":"25"}'
+
+Invoke-WebRequest -Uri http://127.0.0.1:18981/download/AS9283331.xlsx -OutFile AS9283331.xlsx
 ```
 
-### Errors
+### Status codes
 
-| Status | Body | Cause |
-|---|---|---|
-| 400 | `{"ok":false,"error":"字段不在白名单中: X"}` | Field absent from `allowed_fields` |
-| 400 | `{"ok":false,"error":"items 不能为空"}` | Empty `items` array |
-| 400 | `{"ok":false,"error":"value 不能包含换行或以 @ 开头"}` | Value would corrupt the file format |
-| 500 | `{"ok":false,"error":"..."}` | I/O failure, or the field does not exist in the file |
+| Status | Meaning |
+|---|---|
+| 400 | Bad parameter: field not whitelisted, bad value, or `type` not allowed |
+| 404 | No matching file for download |
+| 409 | Multiple matches — retry with one of the returned full names |
+| 500 | File I/O failure, or download directory unavailable |
 
-Error strings are currently emitted in Chinese by the implementation.
+## Packaging and Distribution
 
-Value constraints apply to every request: no `\n`/`\r`, and no leading `@` after trimming.
-
-## Build & Distribution
+### Build
 
 ```bash
 cargo build --release
 ```
 
-Artifact: `target/release/config-api` (Windows: `target\release\config-api.exe`). Debug builds from `cargo run` are not meant for distribution.
+The artifact is `target/release/config-api` (Windows: `target\release\config-api.exe`). **Do not distribute the debug binary produced by `cargo run`.**
 
-Ship `config-api(.exe)` together with `config.toml`. The target machine needs **no runtime** — no Rust, no Python, no JVM.
+Zip this folder:
 
-Cross-platform rules worth remembering:
-
-- A macOS binary must be built on macOS (Apple SDK licensing); building it from Windows/Linux is not viable.
-- Linux → Windows works if `mingw-w64` is installed; macOS → Windows effectively does not.
-- Windows binaries built with MSVC depend on the VC++ runtime. For bare machines, target `x86_64-pc-windows-gnu` or install the VC++ Redistributable.
-
-## Continuous Integration
-
-`.github/workflows/build.yml` builds all four targets in parallel.
-
-- Triggered by a tag push (`v*`) or manually via *Run workflow*; pushing to `main` does **not** trigger it.
-- Matrix: `windows-2022` (x86_64-pc-windows-msvc, static CRT), `ubuntu-24.04` (x86_64-unknown-linux-musl), `ubuntu-24.04-arm` (aarch64-unknown-linux-musl), `macos-15` (aarch64-apple-darwin).
-- The musl builds are fully static, so they run regardless of the target machine's glibc version.
-- On tags, the `release` job zips each platform bundle and attaches it to a GitHub Release.
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
+```text
+config-api-1.0.0-windows-x64/
+├── config-api.exe
+├── config.toml
+├── data/SmartViewConfig.txt
+├── data/downloads/
+└── README.md
 ```
 
-## Project Layout
+### On the target machine
 
+1. Unzip anywhere (a fixed path is convenient for service scripts)
+2. Edit `config.toml` for the real environment
+3. Put the target txt in `files.base_dir` and downloadable files in `download.roots`
+4. Double-click the exe or start it from a command line
+5. Verify from another machine: `http://internal-ip:18981/api/config`
+
+### LAN access
+
+Local only: keep `host = "127.0.0.1"`.
+
+For other machines on the LAN: set `host` to **this machine's internal IP** (e.g. `192.168.1.10`) and open port `18981` in Windows Firewall:
+
+```powershell
+New-NetFirewallRule -DisplayName "config-api-18981" `
+  -Direction Inbound -Protocol TCP -LocalPort 18981 `
+  -RemoteAddress 192.168.1.0/24 -Action Allow
 ```
-config-api/
-├── .github/workflows/build.yml   # 4-target release pipeline
-├── docs/                         # full implementation & packaging guide (Chinese)
-├── src/
-│   └── main.rs
-├── .gitignore
-├── Cargo.lock                    # committed: this is an application, not a library
-└── Cargo.toml
-```
 
-Planned module split:
+Adjust the subnet and port to match your environment. **After deployment, try the port from outside the LAN to confirm it is unreachable** — this build has no login authentication; the network boundary is the security boundary.
 
-| File | Responsibility |
-|---|---|
-| `src/config.rs` | Load and validate `config.toml` |
-| `src/state.rs` | Shared state + async write lock |
-| `src/parser.rs` | Parse / render / patch the `@field` file format |
-| `src/handler.rs` | The three HTTP handlers |
-| `src/main.rs` | Bootstrap, routing, listener |
+### Cross-platform notes
+
+- macOS binaries must be built on macOS
+- The Linux musl build is fully static and works regardless of the target's glibc version (Kylin, UOS, openEuler)
+- Windows MSVC builds need the VC++ runtime; use a static-CRT build or install the VC++ Redistributable on bare machines
+- Unsigned executables may be flagged by antivirus; code signing is recommended for internal distribution
 
 ## Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
-| `link.exe not found` | VS Build Tools missing the *Desktop development with C++* workload |
-| First build takes minutes | Normal — hundreds of crates are compiled once; later builds are incremental |
+| Exits immediately: `base_dir` does not exist | Wrong path, or Windows backslashes not doubled |
+| `download.roots` does not exist | Create the download directory at the configured path |
 | `Address already in use` | Port taken; change `server.port` or stop the old process |
-| Exits immediately: `base_dir does not exist` | Wrong path in `config.toml`, or unescaped Windows backslashes |
-| `os error 32` on write | The file is locked by another process (Notepad, sync client) |
-| Garbled CJK text | The file is GBK but the service reads/writes UTF-8; re-save as UTF-8 or add `encoding_rs` |
-| Unreachable from the LAN | Set `host = "0.0.0.0"` and open the port in the firewall |
-| Antivirus flags the exe | Unsigned binaries are often false-flagged; code-sign for internal distribution |
+| Unreachable from the LAN | Check `host` is the internal IP and the firewall rule is in place |
+| Download returns 404 | Check the type is in `extensions` and the name's last segment matches |
+| Download returns 409 | Multiple candidates — retry with a full name from the response |
+| `os error 32` on write | File locked by Notepad or a sync client; close it |
+| Garbled CJK text | Target file is GBK; re-save as UTF-8 |
+| Browser CORS error | Add the front-end origin to `[cors].allowed_origins` |
 
-## Further Reading
+## Document Index
 
-The full design notes, packaging matrix, and CI rationale live in [`docs/Axum配置接口_完整实现与打包指南.md`](docs/Axum配置接口_完整实现与打包指南.md) (Chinese).
-
-Planned extensions: bearer-token auth, audit log (`timestamp<TAB>field<TAB>old<TAB>new`), `dry_run` preflight for batch updates.
+- This file: run, configure, API, and packaging for users
+- [`docs/Axum配置接口_完整实现与打包指南.md`](docs/Axum配置接口_完整实现与打包指南.md): for developers — module-by-module code notes and the packaging matrix (Chinese)
+- [`docs/Axum配置接口_手把手教程.md`](docs/Axum配置接口_手把手教程.md): for learners — from Hello World to the final version, step by step (Chinese)
 
 ## License
 
-Released under the [MIT License](LICENSE).
-
-Copyright (c) 2026 jasonbu163
+Released under the [MIT License](LICENSE). Copyright (c) 2026 jasonbu163
