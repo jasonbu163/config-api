@@ -1,5 +1,5 @@
 @DataName
-BATCH001
+GGA021123
 
 @Thickness
 30

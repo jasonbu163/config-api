@@ -11,26 +11,27 @@ use std::path::Path;              // 路径借用类型
 use tempfile::NamedTempFile;      // 同目录临时文件，用于原子替换
 use tokio::fs::File;              // 异步打开文件，供流式下载
 use tokio_util::io::ReaderStream; // 把 File 包装成异步字节流
+use utoipa::ToSchema;             // 从结构体生成 OpenAPI schema
 
 use crate::download;              // 文件名校验与候选收集模块
 use crate::parser;                // 文档解析与最小改动写入模块
 use crate::state::AppState;       // 共享状态类型
 
 /// 单字段请求体：{ "name": "DataName", "value": "TT26071311A002" }
-#[derive(Debug, Deserialize)]     // 可打印；从 JSON 请求体反序列化
+#[derive(Debug, Deserialize, ToSchema)] // 可打印；从 JSON 请求体反序列化；同时生成 OpenAPI schema
 pub struct UpdateRequest {        // 对应单字段更新接口
     pub name: String,             // 字段名，必须在白名单里
     pub value: String,            // 新值，不能含换行或以 @ 开头
 }                                 // 结构体结束
 
 /// 批量请求体（方案 A）：{ "items": [ {name, value}, ... ] }
-#[derive(Debug, Deserialize)]     // 同上
+#[derive(Debug, Deserialize, ToSchema)] // 同上：可打印、反序列化、生成 schema
 pub struct BatchRequest {         // 对应批量更新接口
     pub items: Vec<UpdateRequest>, // 多条更新；空数组会被拒绝
 }                                 // 结构体结束
 
 /// 下载检查请求体：{ "name": "A12331", "type": "xls" }
-#[derive(Debug, Deserialize)]     // 可打印；从 JSON 请求体反序列化
+#[derive(Debug, Deserialize, ToSchema)] // 可打印；从 JSON 请求体反序列化；同时生成 OpenAPI schema
 pub struct CheckRequest {         // 对应 POST /api/download/check
     pub name: String,             // 文件标识；必填，单段安全文件名
     #[serde(rename = "type", default)] // type 是 Rust 关键字，且允许省略
@@ -38,6 +39,15 @@ pub struct CheckRequest {         // 对应 POST /api/download/check
 }                                 // 结构体结束
 
 /// GET /api/config —— 读取当前文档解析结果
+#[utoipa::path(
+    get,
+    path = "/api/config",
+    tag = "config",
+    responses(
+        (status = 200, description = "读取成功"),
+        (status = 500, description = "读取文档失败")
+    )
+)]
 pub async fn read_config(State(state): State<AppState>) -> Response { // axum handler 签名
     let _guard = state.lock_read().await; // 拿读锁；下划线开头表示只用它的生命周期
     let path = state.config.config_file_path(); // 得到目标文档完整路径
@@ -60,6 +70,17 @@ pub async fn read_config(State(state): State<AppState>) -> Response { // axum ha
 }                                                       // read_config 结束
 
 /// POST /api/config/update —— 修改单个字段
+#[utoipa::path(
+    post,
+    path = "/api/config/update",
+    tag = "config",
+    request_body = UpdateRequest,
+    responses(
+        (status = 200, description = "修改成功"),
+        (status = 400, description = "参数或白名单校验失败"),
+        (status = 500, description = "读写文件失败")
+    )
+)]
 pub async fn update_one(                                // handler 签名
     State(state): State<AppState>,                      // 注入共享状态
     Json(req): Json<UpdateRequest>,                     // 注入解析后的请求体
@@ -75,6 +96,17 @@ pub async fn update_one(                                // handler 签名
 
 /// POST /api/config/batch-update —— 批量修改
 /// 语义：白名单校验 → 生成新文本 → 备份 → 原子替换；任一步失败则原文档不变。
+#[utoipa::path(
+    post,
+    path = "/api/config/batch-update",
+    tag = "config",
+    request_body = BatchRequest,
+    responses(
+        (status = 200, description = "批量修改成功"),
+        (status = 400, description = "批量校验失败"),
+        (status = 500, description = "读写文件失败")
+    )
+)]
 pub async fn batch_update(                              // handler 签名
     State(state): State<AppState>,                      // 注入共享状态
     Json(req): Json<BatchRequest>,                      // 注入批量请求体
@@ -157,6 +189,21 @@ async fn apply_updates(                                 // 写文档的唯一入
 
 /// GET /download/{name} —— 从配置目录取文件。
 /// 两级精确匹配；0 个候选 404，1 个流式返回，多个 409 不猜。
+#[utoipa::path(
+    get,
+    path = "/download/{name}",
+    tag = "download",
+    params(
+        ("name" = String, Path, description = "文件名或编号，单段")
+    ),
+    responses(
+        (status = 200, description = "文件字节流", content_type = "application/octet-stream"),
+        (status = 400, description = "文件名非法"),
+        (status = 404, description = "未找到匹配文件"),
+        (status = 409, description = "匹配到多个文件"),
+        (status = 500, description = "读取文件失败")
+    )
+)]
 pub async fn download_file(                             // 下载 handler
     State(state): State<AppState>,                      // 注入共享状态
     AxumPath(name): AxumPath<String>,                   // 单段文件名，由 axum 先做路径切分
@@ -241,6 +288,18 @@ pub async fn download_file(                             // 下载 handler
 
 /// POST /api/download/check —— 查询文件是否存在，不返回文件内容。
 /// 复用 download::find_candidates，type 只是额外的扩展名过滤。
+#[utoipa::path(
+    post,
+    path = "/api/download/check",
+    tag = "download",
+    request_body = CheckRequest,
+    responses(
+        (status = 200, description = "查询完成，结果见 exist / count / files"),
+        (status = 400, description = "参数非法或 type 不在允许列表"),
+        (status = 404, description = "下载接口未启用"),
+        (status = 500, description = "目录不可读")
+    )
+)]
 pub async fn check_download(                             // check handler
     State(state): State<AppState>,                      // 注入共享状态
     Json(req): Json<CheckRequest>,                      // 注入请求体

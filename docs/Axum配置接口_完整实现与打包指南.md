@@ -97,6 +97,8 @@ cargo add tracing-subscriber --features env-filter,json
 cargo add anyhow
 cargo add tempfile
 cargo add tokio-util --features io
+cargo add utoipa --features axum_extras
+cargo add utoipa-swagger-ui --features axum,vendored
 ```
 
 - **axum**：Web 框架，定位类似 FastAPI。本方案只处理 JSON 请求和文件下载，不需要 `multipart` feature（那是上传用的）。
@@ -109,6 +111,8 @@ cargo add tokio-util --features io
 - **anyhow**：简化应用层错误链。
 - **tempfile**：写临时文件并 `persist` 到目标路径，实现跨平台原子替换。
 - **tokio-util**：提供 `ReaderStream`，把 `tokio::fs::File` 变成异步字节流；只启用 `io` feature，下载大文件时不必一次性读进内存。
+- **utoipa**：从 handler 上的 `#[utoipa::path]` 注解生成 OpenAPI JSON；`axum_extras` 让它忽略 `State`、`Path` 这类 axum 专有提取器。
+- **utoipa-swagger-ui**：把 Swagger UI 页面挂到 axum 路由；`vendored` 把静态资源打进二进制，内网机器访问页面不需要外网 CDN。
 
 接口可能由浏览器页面调用，因此默认启用 CORS，但**不允许硬编码 `*` 加凭证**。允许来源写在 `config.toml` 的 `[cors]` 段里，preflight `OPTIONS` 由 `CorsLayer` 自动处理，不需要单独写路由。
 
@@ -783,26 +787,27 @@ use std::path::Path;              // 路径借用类型
 use tempfile::NamedTempFile;      // 同目录临时文件，用于原子替换
 use tokio::fs::File;              // 异步打开文件，供流式下载
 use tokio_util::io::ReaderStream; // 把 File 包装成异步字节流
+use utoipa::ToSchema;             // 从结构体生成 OpenAPI schema
 
 use crate::download;              // 文件名校验与候选收集模块
 use crate::parser;                // 文档解析与最小改动写入模块
 use crate::state::AppState;       // 共享状态类型
 
 /// 单字段请求体：{ "name": "DataName", "value": "TT26071311A002" }
-#[derive(Debug, Deserialize)]     // 可打印；从 JSON 请求体反序列化
+#[derive(Debug, Deserialize, ToSchema)]     // 可打印；从 JSON 请求体反序列化
 pub struct UpdateRequest {        // 对应单字段更新接口
     pub name: String,             // 字段名，必须在白名单里
     pub value: String,            // 新值，不能含换行或以 @ 开头
 }                                 // 结构体结束
 
 /// 批量请求体（方案 A）：{ "items": [ {name, value}, ... ] }
-#[derive(Debug, Deserialize)]     // 同上
+#[derive(Debug, Deserialize, ToSchema)]     // 同上
 pub struct BatchRequest {         // 对应批量更新接口
     pub items: Vec<UpdateRequest>, // 多条更新；空数组会被拒绝
 }                                 // 结构体结束
 
 /// 下载检查请求体：{ "name": "A12331", "type": "xls" }
-#[derive(Debug, Deserialize)]     // 可打印；从 JSON 请求体反序列化
+#[derive(Debug, Deserialize, ToSchema)]     // 可打印；从 JSON 请求体反序列化
 pub struct CheckRequest {         // 对应 POST /api/download/check
     pub name: String,             // 文件标识；必填，单段安全文件名
     #[serde(rename = "type", default)] // type 是 Rust 关键字，且允许省略
@@ -810,6 +815,15 @@ pub struct CheckRequest {         // 对应 POST /api/download/check
 }                                 // 结构体结束
 
 /// GET /api/config —— 读取当前文档解析结果
+#[utoipa::path(
+    get,
+    path = "/api/config",
+    tag = "config",
+    responses(
+        (status = 200, description = "读取成功"),
+        (status = 500, description = "读取文档失败")
+    )
+)]
 pub async fn read_config(State(state): State<AppState>) -> Response { // axum handler 签名
     let _guard = state.lock_read().await; // 拿读锁；下划线开头表示只用它的生命周期
     let path = state.config.config_file_path(); // 得到目标文档完整路径
@@ -832,6 +846,17 @@ pub async fn read_config(State(state): State<AppState>) -> Response { // axum ha
 }                                                       // read_config 结束
 
 /// POST /api/config/update —— 修改单个字段
+#[utoipa::path(
+    post,
+    path = "/api/config/update",
+    tag = "config",
+    request_body = UpdateRequest,
+    responses(
+        (status = 200, description = "修改成功"),
+        (status = 400, description = "参数或白名单校验失败"),
+        (status = 500, description = "读写文件失败")
+    )
+)]
 pub async fn update_one(                                // handler 签名
     State(state): State<AppState>,                      // 注入共享状态
     Json(req): Json<UpdateRequest>,                     // 注入解析后的请求体
@@ -847,6 +872,17 @@ pub async fn update_one(                                // handler 签名
 
 /// POST /api/config/batch-update —— 批量修改
 /// 语义：白名单校验 → 生成新文本 → 备份 → 原子替换；任一步失败则原文档不变。
+#[utoipa::path(
+    post,
+    path = "/api/config/batch-update",
+    tag = "config",
+    request_body = BatchRequest,
+    responses(
+        (status = 200, description = "批量修改成功"),
+        (status = 400, description = "批量校验失败"),
+        (status = 500, description = "读写文件失败")
+    )
+)]
 pub async fn batch_update(                              // handler 签名
     State(state): State<AppState>,                      // 注入共享状态
     Json(req): Json<BatchRequest>,                      // 注入批量请求体
@@ -929,6 +965,21 @@ async fn apply_updates(                                 // 写文档的唯一入
 
 /// GET /download/{name} —— 从配置目录取文件。
 /// 两级精确匹配；0 个候选 404，1 个流式返回，多个 409 不猜。
+#[utoipa::path(
+    get,
+    path = "/download/{name}",
+    tag = "download",
+    params(
+        ("name" = String, Path, description = "文件名或编号，单段")
+    ),
+    responses(
+        (status = 200, description = "文件字节流", content_type = "application/octet-stream"),
+        (status = 400, description = "文件名非法"),
+        (status = 404, description = "未找到匹配文件"),
+        (status = 409, description = "匹配到多个文件"),
+        (status = 500, description = "读取文件失败")
+    )
+)]
 pub async fn download_file(                             // 下载 handler
     State(state): State<AppState>,                      // 注入共享状态
     AxumPath(name): AxumPath<String>,                   // 单段文件名，由 axum 先做路径切分
@@ -1013,6 +1064,18 @@ pub async fn download_file(                             // 下载 handler
 
 /// POST /api/download/check —— 查询文件是否存在，不返回文件内容。
 /// 复用 download::find_candidates，type 只是额外的扩展名过滤。
+#[utoipa::path(
+    post,
+    path = "/api/download/check",
+    tag = "download",
+    request_body = CheckRequest,
+    responses(
+        (status = 200, description = "查询完成，结果见 exist / count / files"),
+        (status = 400, description = "参数非法或 type 不在允许列表"),
+        (status = 404, description = "下载接口未启用"),
+        (status = 500, description = "目录不可读")
+    )
+)]
 pub async fn check_download(                             // check handler
     State(state): State<AppState>,                      // 注入共享状态
     Json(req): Json<CheckRequest>,                      // 注入请求体
@@ -1147,6 +1210,30 @@ use std::net::{IpAddr, SocketAddr};    // IP 与 IP+端口
 use tower_http::cors::{Any, CorsLayer}; // CORS 中间件
 use tower_http::trace::TraceLayer;      // 请求日志中间件
 use tracing_subscriber::EnvFilter;      // 从 RUST_LOG 读取日志级别
+use utoipa::OpenApi;                    // 从注解生成 OpenAPI 文档
+use utoipa_swagger_ui::SwaggerUi;       // Swagger UI 页面
+
+/// OpenAPI 文档入口：聚合所有带 utoipa::path 注解的 handler。
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        handler::read_config,
+        handler::update_one,
+        handler::batch_update,
+        handler::download_file,
+        handler::check_download
+    ),
+    components(schemas(
+        handler::UpdateRequest,
+        handler::BatchRequest,
+        handler::CheckRequest
+    )),
+    tags(
+        (name = "config", description = "配置文件读写接口"),
+        (name = "download", description = "文件下载与存在性查询接口")
+    )
+)]
+struct ApiDoc;
 
 /// 根据配置构造 CORS 中间件；非法 Origin 会让服务启动失败。
 fn build_cors(config: &config::AppConfig) -> anyhow::Result<CorsLayer> { // 返回 CorsLayer 或错误
@@ -1228,6 +1315,10 @@ async fn main() -> anyhow::Result<()> {              // 程序入口；错误由
 
     let app = app                                   // 接上注入与中间件
         .with_state(state)                          // 注入共享状态
+        .merge(                                     // 挂 Swagger UI 与 OpenAPI JSON
+            SwaggerUi::new("/docs")           // 浏览器打开这个地址
+                .url("/openapi.json", ApiDoc::openapi()) // 文档数据
+        )
         .layer(cors)                                // 挂 CORS；OPTIONS 预检由它自动应答
         .layer(TraceLayer::new_for_http());         // 挂请求日志；配合 tower_http=debug
 
@@ -1242,6 +1333,23 @@ async fn main() -> anyhow::Result<()> {              // 程序入口；错误由
     Ok(())                                          // 正常退出返回 Ok
 }                                                   // main 结束
 ```
+
+### Swagger UI 配置要点
+
+Swagger UI 不是 axum 的内置能力，最终版本通过三个动作接入：
+
+1. 请求体结构体 `UpdateRequest` / `BatchRequest` / `CheckRequest` 派生 `ToSchema`，生成 `components.schemas`。`CheckRequest` 的 `#[serde(rename = "type")]` 会被 utoipa 识别，文档里显示 `type` 而不是 `file_type`。
+2. 五个 handler 加 `#[utoipa::path]` 注解，声明路径、请求体和响应码。`axum_extras` feature 让 utoipa 忽略 `State`、`AxumPath` 等 axum 专有提取器。
+3. `main.rs` 用 `#[derive(OpenApi)]` 聚合 `paths` 和 `schemas`，再用 `SwaggerUi::new("/docs").url("/openapi.json", ...)` 通过 `.merge()` 挂到 Router 上。`merge` 必须在 `with_state` 之后、`layer` 之前。
+
+访问地址：
+
+- 页面：`http://127.0.0.1:18981/docs/`（末尾 `/` 不要省）
+- OpenAPI JSON：`http://127.0.0.1:18981/openapi.json`
+
+当前锁定版本是 `utoipa 6.x` + `utoipa-swagger-ui 10.x`，直接写 `SwaggerUi::new("/docs")` 即可，不需要旧版的 `/{_:.*}` 通配。`vendored` feature 把页面静态资源编进二进制，内网机器访问页面不依赖外网 CDN。
+
+两点提醒：本方案不做鉴权，页面和接口一样靠网络隔离保护；如果 `download.enabled = false`，下载路由没有注册，但 OpenAPI 里仍会列出这两个接口，看文档时要结合实际配置。
 
 ### 5.7 `Cargo.toml` 的 release 优化段
 
@@ -1385,6 +1493,18 @@ curl -X POST http://127.0.0.1:8080/api/download/check \
 ```
 
 启动后终端应持续输出 JSON Lines；如果没有每次请求日志，检查 `RUST_LOG` 是否包含 `tower_http=debug`。
+
+**Swagger UI 接口文档**
+
+```bash
+# 页面：浏览器打开 http://127.0.0.1:18981/docs/
+curl -I http://127.0.0.1:18981/docs/          # 200
+
+# OpenAPI JSON
+curl http://127.0.0.1:18981/openapi.json
+```
+
+JSON 里应有 5 个 path（`/api/config`、`/api/config/update`、`/api/config/batch-update`、`/download/{name}`、`/api/download/check`）和 3 个 schema（`UpdateRequest`、`BatchRequest`、`CheckRequest`）。
 
 ---
 
@@ -1645,6 +1765,6 @@ git push origin v1.0.0     # 触发 CI，四个目标并行构建并发布
 - **dry_run 预检**：批量接口加 `"dry_run": true`，只校验不落盘。
 - **Range 请求**：当前下载固定返回整文件（配合 `attachment` 强制下载，不做内联预览），因此没有实现 `206 Partial Content`。若要支持浏览器断点续传或 PDF 内联预览，再加单段 Range 解析与 `Accept-Ranges` 头。
 - **目录索引缓存**：现在每次下载请求都会扫描 `roots`。目录文件数上千时，可在启动时建索引，并用定时刷新或文件变更事件更新；注意刷新同样要做符号链接与越界检查。
-- **Swagger UI**：axum 不自带 Swagger；如需交互式接口文档，可用 `utoipa` + `utoipa-swagger-ui` 增加 `/swagger-ui` 和 `/api-docs/openapi.json`，做法见手把手教程的阶段 12.5。
+- **Swagger UI**：axum 不自带 Swagger，但**最终版本已集成**：页面 `/docs/`、数据 `/openapi.json`，`vendored` 资源离线可用。配置步骤见 5.6 之后的「Swagger UI 配置要点」，教学推导见手把手教程阶段 12.5。
 - **schema 版本**：在文档头部加 `# schema=v1`，解析时校验版本，避免文档格式悄悄变化。
 - **数据库化**：当数据从 txt 迁到 SQLite / MySQL 时再引入 `sea-orm` + `sea-orm-migration`；当前只读写 txt，引入 ORM 只会增加编译时间与复杂度。

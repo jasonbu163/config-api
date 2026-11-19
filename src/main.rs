@@ -14,6 +14,30 @@ use std::net::{IpAddr, SocketAddr};    // IP 与 IP+端口
 use tower_http::cors::{Any, CorsLayer}; // CORS 中间件
 use tower_http::trace::TraceLayer;      // 请求日志中间件
 use tracing_subscriber::EnvFilter;      // 从 RUST_LOG 读取日志级别
+use utoipa::OpenApi;                    // 从注解生成 OpenAPI 文档
+use utoipa_swagger_ui::SwaggerUi;       // Swagger UI 页面
+
+/// OpenAPI 文档入口：聚合所有带 utoipa::path 注解的 handler。
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        handler::read_config,
+        handler::update_one,
+        handler::batch_update,
+        handler::download_file,
+        handler::check_download
+    ),
+    components(schemas(
+        handler::UpdateRequest,
+        handler::BatchRequest,
+        handler::CheckRequest
+    )),
+    tags(
+        (name = "config", description = "配置文件读写接口"),
+        (name = "download", description = "文件下载与存在性查询接口")
+    )
+)]
+struct ApiDoc;
 
 /// 根据配置构造 CORS 中间件；非法 Origin 会让服务启动失败。
 fn build_cors(config: &config::AppConfig) -> anyhow::Result<CorsLayer> { // 返回 CorsLayer 或错误
@@ -95,6 +119,10 @@ async fn main() -> anyhow::Result<()> {              // 程序入口；错误由
 
     let app = app                                   // 接上注入与中间件
         .with_state(state)                          // 注入共享状态
+        .merge(                                     // 挂 Swagger UI 与 OpenAPI JSON
+            SwaggerUi::new("/docs")           // 浏览器打开这个地址
+                .url("/openapi.json", ApiDoc::openapi()) // 文档数据
+        )
         .layer(cors)                                // 挂 CORS；OPTIONS 预检由它自动应答
         .layer(TraceLayer::new_for_http());         // 挂请求日志；配合 tower_http=debug
 

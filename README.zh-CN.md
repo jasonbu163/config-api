@@ -21,6 +21,7 @@
 - 先查再下：`POST /api/download/check`，返回是否存在、数量和文件名列表
 - 下载目录、允许的文件类型、大小上限都在 `config.toml` 里配
 - 启动期校验：配置写错立刻退出，不会带病运行
+- 内置 Swagger UI：浏览器打开 `/docs/` 就能看到五个接口的文档，离线可用
 
 ## 工作原理
 
@@ -53,6 +54,8 @@ flowchart TD
 ```
 
 两条主线：配置改写经过读写锁、白名单和原子替换；下载走目录扫描和两级精确匹配。`config.toml` 同时决定能改哪些字段、从哪些目录下载、允许哪些类型。
+
+另外有一个独立的 Swagger UI 路由 `/docs/`，它读取服务自己生成的 OpenAPI JSON（`/openapi.json`），不参与上面两条业务主线。
 
 ## 你会拿到什么
 
@@ -104,7 +107,7 @@ Windows：双击 `config-api.exe`，或在 PowerShell 里运行：
 curl http://127.0.0.1:18981/api/config
 ```
 
-看到 `{"ok":true,"file":"...","fields":[...]}` 就说明起来了。
+看到 `{"ok":true,"file":"...","fields":[...]}` 就说明起来了。浏览器打开 `http://127.0.0.1:18981/docs/` 能看到接口文档，说明服务完全正常。
 
 ### 4. 停止
 
@@ -283,6 +286,14 @@ Invoke-RestMethod -Uri http://127.0.0.1:18981/api/config/update -Method Post `
 Invoke-WebRequest -Uri http://127.0.0.1:18981/download/AS9283331.xlsx -OutFile AS9283331.xlsx
 ```
 
+### 接口文档（Swagger UI）
+
+浏览器打开 `http://127.0.0.1:18981/docs/`，可以看到全部五个接口的请求体、参数和响应说明，也能在页面上直接发起请求。地址末尾的 `/` 不要省。
+
+机器可读的 OpenAPI JSON 在 `http://127.0.0.1:18981/openapi.json`。
+
+页面静态资源已打包进程序，内网机器不需要访问外网 CDN。如果 `download.enabled = false`，文档里仍会列出下载接口，但实际并未注册，以配置为准。
+
 ### 错误码
 
 | 状态码 | 含义 |
@@ -312,6 +323,8 @@ config-api-1.0.0-windows-x64/
 ├── data/downloads/
 └── README.md
 ```
+
+Swagger UI 的静态资源已经编进 exe，不用额外打包网页文件，目标机器也不需要访问外网 CDN。
 
 ### 目标机器上的步骤
 
@@ -355,10 +368,12 @@ New-NetFirewallRule -DisplayName "config-api-18981" `
 | 写文件报 `os error 32` | 文件被记事本或同步盘占用，关掉占用程序 |
 | 中文乱码 | 目标文件是 GBK；另存为 UTF-8 |
 | 浏览器提示 CORS | 把前端页面地址写进 `[cors].allowed_origins` |
+| 打开 `/docs/` 是 404 | 地址末尾必须带 `/`；确认用的是包含 Swagger UI 的新版本程序 |
 
 ## 文档索引
 
 - 本文：面向使用者的运行、配置、接口与打包说明
+- [`docs/Windows打包分发速查.md`](docs/Windows打包分发速查.md)：拷贝到另一台 Windows 运行的最短清单与踩坑记录
 - [`docs/Axum配置接口_完整实现与打包指南.md`](docs/Axum配置接口_完整实现与打包指南.md)：面向开发者，逐模块代码说明与打包矩阵
 - [`docs/Axum配置接口_手把手教程.md`](docs/Axum配置接口_手把手教程.md)：面向学习者，从 Hello World 一步步推导到最终版本
 

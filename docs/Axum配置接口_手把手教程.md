@@ -26,7 +26,7 @@
 | 10 | 备份 + 临时文件 + 原子替换 | 失败时原文档不变 | 日志还是普通文本 |
 | 11 | JSON 日志 + 请求日志 | 每次请求一行 JSON | 浏览器跨域会被拦 |
 | 12 | CORS | 前端页面可跨域调用 | CORS 不是鉴权 |
-| 12.5 | Swagger UI（可选） | 浏览器打开 `/swagger-ui` 看接口文档 | 文档需随代码维护 |
+| 12.5 | Swagger UI | 浏览器打开 `/docs/` 看五个接口的文档 | 文档需随代码维护 |
 | 12.8 | 文件下载 + 存在性查询 | 短名下载文件，POST 查询是否存在及数量 | 每次请求都扫目录，且没有 Range |
 | 13 | 收口到最终版本 | 对照完整指南 | 生产要确认网络边界 |
 
@@ -1232,7 +1232,7 @@ CORS 只解决浏览器同源策略，**不是鉴权**。任何 curl / Postman �
 
 ---
 
-## 阶段 12.5（可选）：补一个 Swagger UI 页面
+## 阶段 12.5：补一个 Swagger UI 页面
 
 ### 先回答一个常见疑问
 
@@ -1247,20 +1247,22 @@ CORS 只解决浏览器同源策略，**不是鉴权**。任何 curl / Postman �
 - `utoipa`：用宏从 Rust 代码生成 OpenAPI JSON。
 - `utoipa-swagger-ui`：把 Swagger UI 页面挂到 axum 路由上。
 
-所以教程前面没写它不是漏了核心能力，而是它属于**可选增强**；但它很适合放进教材，因为它能让你直观看到每个阶段新增了哪些接口。
+这个阶段现在属于**最终版本**：五个接口都有注解，浏览器打开就能看到完整文档。
 
 ### 加依赖
 
 ```bash
 cargo add utoipa --features axum_extras
-cargo add utoipa-swagger-ui --features axum
+cargo add utoipa-swagger-ui --features axum,vendored
 ```
 
-如果构建机不能联网，注意 `utoipa-swagger-ui` 默认可能要下载 Swagger UI 静态资源；离线场景请查对应版本的 `vendored` / 离线 feature，或提前准备资源。
+`axum_extras` 让 utoipa 忽略 `State`、`AxumPath` 这类 axum 专有提取器，只分析真正的请求体。
 
-### 给请求 / 响应结构体加 `ToSchema`
+**`vendored` 很关键**：它会把 Swagger UI 的静态资源打包进二进制。如果不加，页面可能要从 CDN 拉 JS / CSS，内网机器没外网就打不开。本软件跑在内网，所以必须加。
 
-在 `handler.rs`：
+### 给请求结构体加 `ToSchema`
+
+在 `handler.rs`，三个请求体都加上 `ToSchema`：
 
 ```rust
 use utoipa::ToSchema;
@@ -1275,28 +1277,28 @@ pub struct UpdateRequest {
 pub struct BatchRequest {
     pub items: Vec<UpdateRequest>,
 }
-```
 
-在 `parser.rs`：
-
-```rust
-use utoipa::ToSchema;
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct Entry {
-    pub key: String,
-    pub value: String,
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CheckRequest {
+    pub name: String,
+    #[serde(rename = "type", default)]
+    pub file_type: Option<String>,
 }
 ```
 
-### 给 handler 加接口注解
+`#[serde(rename = "type")]` 也会被 utoipa 识别，所以文档里显示的字段名就是 `type`，和实际请求一致。
+
+### 给五个 handler 加接口注解
 
 ```rust
 #[utoipa::path(
     get,
     path = "/api/config",
     tag = "config",
-    responses((status = 200, description = "读取成功"))
+    responses(
+        (status = 200, description = "读取成功"),
+        (status = 500, description = "读取文档失败")
+    )
 )]
 pub async fn read_config(/* ... */) -> Response { /* ... */ }
 
@@ -1323,9 +1325,32 @@ pub async fn update_one(/* ... */) -> Response { /* ... */ }
     )
 )]
 pub async fn batch_update(/* ... */) -> Response { /* ... */ }
-```
 
-`axum_extras` feature 的作用就是让 `utoipa` 能忽略 `State`、`Path` 这类 axum 专有提取器，只分析真正的请求体。
+#[utoipa::path(
+    get,
+    path = "/download/{name}",
+    tag = "download",
+    params(("name" = String, Path, description = "文件名或编号，单段")),
+    responses(
+        (status = 200, description = "文件字节流"),
+        (status = 404, description = "未找到匹配文件"),
+        (status = 409, description = "匹配到多个文件")
+    )
+)]
+pub async fn download_file(/* ... */) -> Response { /* ... */ }
+
+#[utoipa::path(
+    post,
+    path = "/api/download/check",
+    tag = "download",
+    request_body = CheckRequest,
+    responses(
+        (status = 200, description = "查询完成，结果见 exist / count / files"),
+        (status = 400, description = "参数非法")
+    )
+)]
+pub async fn check_download(/* ... */) -> Response { /* ... */ }
+```
 
 ### 定义 OpenAPI 文档入口
 
@@ -1340,35 +1365,39 @@ use utoipa_swagger_ui::SwaggerUi;
     paths(
         handler::read_config,
         handler::update_one,
-        handler::batch_update
+        handler::batch_update,
+        handler::download_file,
+        handler::check_download
     ),
     components(schemas(
         handler::UpdateRequest,
         handler::BatchRequest,
-        parser::Entry
+        handler::CheckRequest
     )),
-    tags((name = "config", description = "文档修改接口"))
+    tags(
+        (name = "config", description = "配置文件读写接口"),
+        (name = "download", description = "文件下载与存在性查询接口")
+    )
 )]
 struct ApiDoc;
 ```
 
 ### 把页面合并进 Router
 
+`merge` 要放在 `with_state` 之后、`layer` 之前：
+
 ```rust
-let app = Router::new()
-    .route("/api/config", get(handler::read_config))
-    .route("/api/config/update", post(handler::update_one))
-    .route("/api/config/batch-update", post(handler::batch_update))
+let app = app
     .with_state(state)
     .merge(
-        SwaggerUi::new("/swagger-ui/{_:.*}")
-            .url("/api-docs/openapi.json", ApiDoc::openapi())
+        SwaggerUi::new("/docs")
+            .url("/openapi.json", ApiDoc::openapi())
     )
     .layer(cors)
     .layer(TraceLayer::new_for_http());
 ```
 
-部分新版 `utoipa-swagger-ui` 也支持直接写 `SwaggerUi::new("/swagger-ui")`，按你锁定的 crate 版本调整即可。
+当前版本（`utoipa-swagger-ui` 10.x）直接写 `SwaggerUi::new("/docs")` 即可，不需要 `/{_:.*}` 通配。
 
 ### 验证
 
@@ -1379,19 +1408,22 @@ cargo run
 浏览器打开：
 
 ```text
-http://127.0.0.1:8080/swagger-ui/
+http://127.0.0.1:18981/docs/
 ```
 
 也可以直接拿 OpenAPI JSON：
 
 ```bash
-curl http://127.0.0.1:8080/api-docs/openapi.json
+curl http://127.0.0.1:18981/openapi.json
 ```
 
-### 两个注意点
+应该看到 5 个 path 和 3 个 schema。注意 URL 末尾的 `/` 不要省。
+
+### 三个注意点
 
 1. Swagger UI 页面和 API 同源，所以它本身不需要 CORS；CORS 是给外部前端页面用的。
-2. 如果接口将来加了 token 鉴权，Swagger UI 也要么一起保护，要么只在开发环境启用，别把生产接口说明公开出去。
+2. Swagger UI 静态资源已通过 `vendored` 打进二进制，内网机器不用访问外网 CDN。
+3. 本方案不做鉴权，页面和接口一样靠网络隔离保护。如果 `download.enabled = false`，下载接口没有注册，但 OpenAPI 里仍会列出它们——看文档时要留意实际配置。
 
 ### 本阶段的遗留问题
 
@@ -1816,7 +1848,7 @@ curl -X POST http://127.0.0.1:8080/api/download/check \
 10. 备份 + 临时文件 + 原子替换。
 11. JSON 日志 + 请求日志。
 12. CORS。
-13. Swagger UI / OpenAPI（可选增强，默认不在最终方案里）。
+13. Swagger UI / OpenAPI：五个接口自动生成文档，`vendored` 静态资源离线可用。
 14. 文件下载与存在性查询：全名精确 + 末段精确两级匹配，多候选返回 409；check 接口复用同一套规则，带可选 `type` 过滤。
 
 接下来请把教程代码**整体替换成最终版本**：
@@ -1830,6 +1862,7 @@ curl -X POST http://127.0.0.1:8080/api/download/check \
   - 统一的 JSON 错误响应。
   - 下载侧额外拦截 Windows 保留设备名，中文文件名按 RFC 5987 编码。
   - 下载候选路径的符号链接 / 越界检查与 `download.*` 日志留痕齐全。
+  - Swagger UI 使用 `vendored` feature，静态资源随二进制分发，内网无需外网 CDN。
   - 完整的逐行中文注释。
   - 四平台 CI 与 Release 打包。
 
